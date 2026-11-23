@@ -1,34 +1,54 @@
 #!/usr/bin/env python3
 # backtest.py — technical-only backtest of Gold Agent entry logic
-import requests, math, datetime
+# Data: Kraken PAXGUSD hourly (paginated, since Binance blocks US IPs)
+import requests, math, datetime, time
 
 UTC = datetime.timezone.utc
 ENTRY_T, STRONG_T = 0.35, 0.60
 
 
-def fetch_binance(days=365):
-    end = int(datetime.datetime.now(UTC).timestamp() * 1000)
-    start = end - days * 86400 * 1000
-    rows, cur = [], start
-    while cur < end:
+def fetch_kraken(days=365):
+    end_ts = int(datetime.datetime.now(UTC).timestamp())
+    since = end_ts - days * 86400
+    rows_dict = {}
+    cursor = since
+    reqs = 0
+    while cursor < end_ts:
         try:
-            r = requests.get("https://api.binance.com/api/v3/klines",
-                             params={"symbol": "PAXGUSDT", "interval": "1h",
-                                     "startTime": cur, "limit": 1000},
+            r = requests.get("https://api.kraken.com/0/public/OHLC",
+                             params={"pair": "PAXGUSD", "interval": 60, "since": cursor},
                              timeout=30)
-            data = r.json()
-            if not isinstance(data, list) or not data:
+            j = r.json()
+            if j.get("error"):
+                print("kraken err:", j["error"])
                 break
-            for x in data:
-                rows.append({"t": int(x[0]) // 1000, "o": float(x[1]),
-                             "h": float(x[2]), "l": float(x[3]), "c": float(x[4])})
-            cur = data[-1][0] + 1
-            if len(data) < 1000:
+            res = j["result"]
+            key = [k for k in res if k != "last"][0]
+            batch = res[key]
+            if not batch:
                 break
+            for x in batch:
+                rows_dict[int(x[0])] = {"t": int(x[0]), "o": float(x[1]),
+                                         "h": float(x[2]), "l": float(x[3]),
+                                         "c": float(x[4])}
+            last_t = int(batch[-1][0])
+            if last_t <= cursor:
+                break
+            cursor = last_t + 3600
+            reqs += 1
+            if len(batch) < 720:
+                break
+            time.sleep(1.5)  # Kraken rate limit ke liye
         except Exception as e:
             print("fetch fail:", e)
             break
-    print(f"fetched {len(rows)} candles ({days} days)")
+
+    rows = sorted(rows_dict.values(), key=lambda x: x["t"])
+    print(f"fetched {len(rows)} candles ({days} days, {reqs} requests)")
+    if rows:
+        start = datetime.datetime.fromtimestamp(rows[0]["t"], UTC).strftime("%Y-%m-%d")
+        end   = datetime.datetime.fromtimestamp(rows[-1]["t"], UTC).strftime("%Y-%m-%d")
+        print(f"range: {start} → {end}")
     return rows
 
 
@@ -67,9 +87,9 @@ def atr_last(h, l, c, n=14):
 
 def score_at(rows, i, e20, e50, e200):
     closes = [x["c"] for x in rows[:i + 1]]
-    highs = [x["h"] for x in rows[:i + 1]]
-    lows  = [x["l"] for x in rows[:i + 1]]
-    price = closes[-1]
+    highs  = [x["h"] for x in rows[:i + 1]]
+    lows   = [x["l"] for x in rows[:i + 1]]
+    price  = closes[-1]
     r = rsi_last(closes)
     a = atr_last(highs, lows, closes)
     trend = (0.6 if price > e200[i] else -0.6) + (0.4 if e20[i] > e50[i] else -0.4)
@@ -116,8 +136,8 @@ def backtest(rows, hold_max=72):
         prev = score_at(rows, i - 1, e20, e50, e200)
         d_now = 1 if cur["total"] >= ENTRY_T else (-1 if cur["total"] <= -ENTRY_T else 0)
         d_old = 1 if prev["total"] >= ENTRY_T else (-1 if prev["total"] <= -ENTRY_T else 0)
-        flip = d_now != 0 and d_now != d_old
-        strong = abs(cur["total"]) >= STRONG_T
+        flip     = d_now != 0 and d_now != d_old
+        strong   = abs(cur["total"]) >= STRONG_T
         near_ema = abs(cur["price"] - cur["e20"]) <= 0.35 * cur["atr"]
 
         if flip or (strong and near_ema):
@@ -126,14 +146,14 @@ def backtest(rows, hold_max=72):
                 i += 1
                 continue
             if cur["total"] > 0:
-                sl = min(min(x["l"] for x in rows[i - 12:i + 1]), price - 1.2 * a)
+                sl   = min(min(x["l"] for x in rows[i - 12:i + 1]), price - 1.2 * a)
                 risk = price - sl
-                tps = [price + risk * k for k in (1, 2, 3)]
+                tps  = [price + risk * k for k in (1, 2, 3)]
                 side = "BUY"
             else:
-                sl = max(max(x["h"] for x in rows[i - 12:i + 1]), price + 1.2 * a)
+                sl   = max(max(x["h"] for x in rows[i - 12:i + 1]), price + 1.2 * a)
                 risk = sl - price
-                tps = [price - risk * k for k in (1, 2, 3)]
+                tps  = [price - risk * k for k in (1, 2, 3)]
                 side = "SELL"
             if risk > 0:
                 open_trade = {"entry_i": i, "side": side, "entry": price,
@@ -148,8 +168,8 @@ def report(trades):
         print("\n❌ Koi trade nahi — signal conditions kabhi poori nahi hui")
         return
     n = len(trades)
-    wins = [t for t in trades if t["result"] == "TP1"]
-    sls = [t for t in trades if t["result"] == "SL"]
+    wins  = [t for t in trades if t["result"] == "TP1"]
+    sls   = [t for t in trades if t["result"] == "SL"]
     touts = [t for t in trades if t["result"] == "TIMEOUT"]
 
     print(f"\n══ BACKTEST RESULTS ══")
@@ -171,7 +191,7 @@ def report(trades):
         r_seq.append(r)
 
     total_r = sum(r_seq)
-    avg_r = total_r / n
+    avg_r   = total_r / n
     eq = peak = mdd = 0.0
     for r in r_seq:
         eq += r
@@ -193,9 +213,9 @@ def report(trades):
 
 
 if __name__ == "__main__":
-    rows = fetch_binance(days=365)
-    if len(rows) < 500:
-        print("Not enough data"); raise SystemExit(1)
+    rows = fetch_kraken(days=365)
+    if len(rows) < 300:
+        print(f"Not enough data ({len(rows)} candles, need 300+)")
+        raise SystemExit(1)
     trades = backtest(rows)
     report(trades)
-          
