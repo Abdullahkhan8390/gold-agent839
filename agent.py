@@ -177,23 +177,49 @@ RULES:
 - fed: hawkish (hikes/tightening) = NEGATIVE for gold. dovish (cuts/easing) = POSITIVE.
 - Both values MUST be floats between -1 and +1.
 """
+    # 1) live model list
+    models = []
     try:
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {GROQ_KEY}",
-                                   "Content-Type": "application/json"},
-                          json={"model": "llama-3.3-70b-versatile",
-                                "messages": [{"role": "user", "content": prompt}],
-                                "temperature": 0.1, "max_tokens": 200,
-                                "response_format": {"type": "json_object"}},
-                          timeout=30)
-        r.raise_for_status()
-        data = json.loads(r.json()["choices"][0]["message"]["content"])
-        return {"geopolitical": max(-1, min(1, float(data.get("geopolitical", 0)))),
-                "fed":          max(-1, min(1, float(data.get("fed", 0)))),
-                "reason_geo":   str(data.get("reason_geo",""))[:200],
-                "reason_fed":   str(data.get("reason_fed",""))[:200]}
+        mr = requests.get("https://api.groq.com/openai/v1/models",
+                          headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=20)
+        if mr.ok:
+            models = [m["id"] for m in mr.json().get("data", [])]
     except Exception as e:
-        print("llm fail:", e); return None
+        print("models list fail:", e)
+
+    prefer = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "openai/gpt-oss-120b",
+              "qwen/qwen3-32b", "llama-3.3-70b-versatile"]
+    tries = [m for m in prefer if m in models] or models or prefer
+    if models:
+        print("llm available:", ", ".join(models[:8]))
+
+    # 2) try models one by one
+    for model in tries[:4]:
+        try:
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                              headers={"Authorization": f"Bearer {GROQ_KEY}",
+                                       "Content-Type": "application/json"},
+                              json={"model": model,
+                                    "messages": [{"role": "user", "content": prompt}],
+                                    "temperature": 0.1, "max_tokens": 250},
+                              timeout=30)
+            if r.status_code == 404:
+                print(f"{model} -> 404, next")
+                continue
+            r.raise_for_status()
+            txt = r.json()["choices"][0]["message"]["content"]
+            s = txt[txt.find("{"): txt.rfind("}") + 1]
+            data = json.loads(s)
+            print("llm model used:", model)
+            return {"geopolitical": max(-1, min(1, float(data.get("geopolitical", 0)))),
+                    "fed":          max(-1, min(1, float(data.get("fed", 0)))),
+                    "reason_geo":   str(data.get("reason_geo", ""))[:200],
+                    "reason_fed":   str(data.get("reason_fed", ""))[:200]}
+        except Exception as e:
+            print(f"llm fail ({model}):", e)
+            continue
+    return None
+
 
 
 def events_next(hours=30):
