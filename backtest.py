@@ -8,48 +8,34 @@ ENTRY_T, STRONG_T = 0.35, 0.60
 
 
 def fetch_kraken(days=365):
-    end_ts = int(datetime.datetime.now(UTC).timestamp())
-    since = end_ts - days * 86400
-    rows_dict = {}
-    cursor = since
-    reqs = 0
-    while cursor < end_ts:
-        try:
-            r = requests.get("https://api.kraken.com/0/public/OHLC",
-                             params={"pair": "PAXGUSD", "interval": 60, "since": cursor},
-                             timeout=30)
-            j = r.json()
-            if j.get("error"):
-                print("kraken err:", j["error"])
-                break
-            res = j["result"]
-            key = [k for k in res if k != "last"][0]
-            batch = res[key]
-            if not batch:
-                break
-            for x in batch:
-                rows_dict[int(x[0])] = {"t": int(x[0]), "o": float(x[1]),
-                                         "h": float(x[2]), "l": float(x[3]),
-                                         "c": float(x[4])}
-            last_t = int(batch[-1][0])
-            if last_t <= cursor:
-                break
-            cursor = last_t + 3600
-            reqs += 1
-            if len(batch) < 720:
-                break
-            time.sleep(1.5)  # Kraken rate limit ke liye
-        except Exception as e:
-            print("fetch fail:", e)
-            break
-
-    rows = sorted(rows_dict.values(), key=lambda x: x["t"])
-    print(f"fetched {len(rows)} candles ({days} days, {reqs} requests)")
+def fetch_yahoo(symbol="GC=F", days=730):
+    import json
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1h", "range": f"{days}d"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    j = r.json()
+    if "chart" not in j or not j["chart"].get("result"):
+        print("yahoo err:", j)
+        return []
+    result = j["chart"]["result"][0]
+    ts = result.get("timestamp", [])
+    q = result["indicators"]["quote"][0]
+    opens, highs, lows, closes = q["open"], q["high"], q["low"], q["close"]
+    rows = []
+    for i in range(len(ts)):
+        if None in (opens[i], highs[i], lows[i], closes[i]):
+            continue
+        rows.append({"t": int(ts[i]), "o": float(opens[i]),
+                     "h": float(highs[i]), "l": float(lows[i]),
+                     "c": float(closes[i])})
+    print(f"fetched {len(rows)} candles ({symbol}, {days}d, 1 request)")
     if rows:
-        start = datetime.datetime.fromtimestamp(rows[0]["t"], UTC).strftime("%Y-%m-%d")
-        end   = datetime.datetime.fromtimestamp(rows[-1]["t"], UTC).strftime("%Y-%m-%d")
+        start = datetime.datetime.fromtimestamp(rows[0]["t"], UTC).strftime("%Y-%m-%d %H:%M")
+        end   = datetime.datetime.fromtimestamp(rows[-1]["t"], UTC).strftime("%Y-%m-%d %H:%M")
         print(f"range: {start} → {end}")
     return rows
+
 
 
 def ema_arr(closes, n):
