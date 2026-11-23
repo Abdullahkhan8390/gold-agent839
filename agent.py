@@ -161,7 +161,7 @@ def llm_sentiment(news_items, fed_items):
         return None
     headlines = "\n".join(f"- {x['title']}" for x in news_items[:10]) or "(none)"
     fedlines  = "\n".join(f"- {x['title']}" for x in fed_items[:5])  or "(none)"
-    prompt = f"""You are a gold trading analyst. Analyze these headlines. Return STRICT JSON only.
+    prompt = f"""You are a gold trading analyst. Analyze these headlines and return STRICT JSON.
 
 GOLD / GEOPOLITICAL / CENTRAL BANK / ETF NEWS:
 {headlines}
@@ -169,15 +169,15 @@ GOLD / GEOPOLITICAL / CENTRAL BANK / ETF NEWS:
 FED NEWS:
 {fedlines}
 
-Return ONLY this JSON (no markdown, no extra text):
+Return ONLY this JSON (no markdown, no explanation):
 {{"geopolitical": <-1 to 1>, "fed": <-1 to 1>, "reason_geo": "<short reason>", "reason_fed": "<short reason>"}}
 
 RULES:
 - geopolitical: war/sanctions/crisis/central-bank-buying = POSITIVE (gold up). peace/de-escalation/CB-selling = NEGATIVE.
 - fed: hawkish (hikes/tightening) = NEGATIVE for gold. dovish (cuts/easing) = POSITIVE.
 - Both values MUST be floats between -1 and +1.
+- Output MUST be valid JSON with those 4 keys.
 """
-    # 1) live model list
     models = []
     try:
         mr = requests.get("https://api.groq.com/openai/v1/models",
@@ -187,38 +187,56 @@ RULES:
     except Exception as e:
         print("models list fail:", e)
 
-    prefer = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "openai/gpt-oss-120b",
-              "qwen/qwen3-32b", "llama-3.3-70b-versatile"]
-    tries = [m for m in prefer if m in models] or models or prefer
-    if models:
-        print("llm available:", ", ".join(models[:8]))
+    skip = ("orpheus", "whisper", "tts", "prompt-guard", "safeguard")
+    valid = [m for m in models if not any(s in m.lower() for s in skip)]
 
-    # 2) try models one by one
-    for model in tries[:4]:
+    prefer = ["qwen/qwen3.8-27b", "qwen/qwen3-32b", "allam-2-7b",
+              "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    if valid:
+        order = [m for m in prefer if m in valid] + [m for m in valid if m not in prefer]
+    else:
+        order = prefer
+    print("llm try:", ", ".join(order[:4]))
+
+    for model in order[:5]:
         try:
+            body = {"model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1, "max_tokens": 500,
+                    "response_format": {"type": "json_object"}}
             r = requests.post("https://api.groq.com/openai/v1/chat/completions",
                               headers={"Authorization": f"Bearer {GROQ_KEY}",
                                        "Content-Type": "application/json"},
-                              json={"model": model,
-                                    "messages": [{"role": "user", "content": prompt}],
-                                    "temperature": 0.1, "max_tokens": 250},
-                              timeout=30)
+                              json=body, timeout=30)
+            if r.status_code == 400:
+                body.pop("response_format", None)
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                                  headers={"Authorization": f"Bearer {GROQ_KEY}",
+                                           "Content-Type": "application/json"},
+                                  json=body, timeout=30)
             if r.status_code == 404:
-                print(f"{model} -> 404, next")
-                continue
-            r.raise_for_status()
-            txt = r.json()["choices"][0]["message"]["content"]
-            s = txt[txt.find("{"): txt.rfind("}") + 1]
-            data = json.loads(s)
+                print(f"{model} -> 404, next"); continue
+            if not r.ok:
+                print(f"{model} -> {r.status_code}: {r.text[:120]}"); continue
+            msg = r.json()["choices"][0]["message"]
+            txt = (msg.get("content") or "").strip()
+            if not txt:
+                txt = (msg.get("reasoning") or "").strip()
+            if not txt:
+                print(f"{model}: empty content, next"); continue
+            i, j = txt.find("{"), txt.rfind("}")
+            if i < 0 or j <= i:
+                print(f"{model}: no JSON, next"); continue
+            data = json.loads(txt[i:j+1])
             print("llm model used:", model)
             return {"geopolitical": max(-1, min(1, float(data.get("geopolitical", 0)))),
                     "fed":          max(-1, min(1, float(data.get("fed", 0)))),
                     "reason_geo":   str(data.get("reason_geo", ""))[:200],
                     "reason_fed":   str(data.get("reason_fed", ""))[:200]}
         except Exception as e:
-            print(f"llm fail ({model}):", e)
-            continue
+            print(f"llm fail ({model}):", e); continue
     return None
+
 
 
 
