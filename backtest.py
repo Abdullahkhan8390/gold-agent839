@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # backtest.py — technical-only backtest of Gold Agent entry logic
-# Data: Kraken PAXGUSD hourly (paginated, since Binance blocks US IPs)
-import requests, math, datetime, time
+# Data: Yahoo Finance GC=F hourly, 2 years
+import requests, datetime
 
 UTC = datetime.timezone.utc
 ENTRY_T, STRONG_T = 0.35, 0.60
 
 
-def fetch_kraken(days=365):
 def fetch_yahoo(symbol="GC=F", days=730):
-    import json
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": "1h", "range": f"{days}d"}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -35,7 +33,6 @@ def fetch_yahoo(symbol="GC=F", days=730):
         end   = datetime.datetime.fromtimestamp(rows[-1]["t"], UTC).strftime("%Y-%m-%d %H:%M")
         print(f"range: {start} → {end}")
     return rows
-
 
 
 def ema_arr(closes, n):
@@ -71,13 +68,10 @@ def atr_last(h, l, c, n=14):
     return sum(trs) / len(trs)
 
 
-def score_at(rows, i, e20, e50, e200):
-    closes = [x["c"] for x in rows[:i + 1]]
-    highs  = [x["h"] for x in rows[:i + 1]]
-    lows   = [x["l"] for x in rows[:i + 1]]
-    price  = closes[-1]
-    r = rsi_last(closes)
-    a = atr_last(highs, lows, closes)
+def score_at(i, e20, e50, e200, closes, highs, lows):
+    price = closes[i]
+    r = rsi_last(closes[i - 14:i + 1])
+    a = atr_last(highs[i - 14:i + 1], lows[i - 14:i + 1], closes[i - 14:i + 1])
     trend = (0.6 if price > e200[i] else -0.6) + (0.4 if e20[i] > e50[i] else -0.4)
     if r >= 72:
         mom = -0.8
@@ -92,6 +86,8 @@ def score_at(rows, i, e20, e50, e200):
 
 def backtest(rows, hold_max=72):
     closes = [x["c"] for x in rows]
+    highs  = [x["h"] for x in rows]
+    lows   = [x["l"] for x in rows]
     e20, e50, e200 = ema_arr(closes, 20), ema_arr(closes, 50), ema_arr(closes, 200)
     trades, open_trade = [], None
     i = 210
@@ -118,8 +114,8 @@ def backtest(rows, hold_max=72):
             i += 1
             continue
 
-        cur  = score_at(rows, i, e20, e50, e200)
-        prev = score_at(rows, i - 1, e20, e50, e200)
+        cur  = score_at(i,     e20, e50, e200, closes, highs, lows)
+        prev = score_at(i - 1, e20, e50, e200, closes, highs, lows)
         d_now = 1 if cur["total"] >= ENTRY_T else (-1 if cur["total"] <= -ENTRY_T else 0)
         d_old = 1 if prev["total"] >= ENTRY_T else (-1 if prev["total"] <= -ENTRY_T else 0)
         flip     = d_now != 0 and d_now != d_old
@@ -132,12 +128,12 @@ def backtest(rows, hold_max=72):
                 i += 1
                 continue
             if cur["total"] > 0:
-                sl   = min(min(x["l"] for x in rows[i - 12:i + 1]), price - 1.2 * a)
+                sl   = min(min(lows[i - 12:i + 1]), price - 1.2 * a)
                 risk = price - sl
                 tps  = [price + risk * k for k in (1, 2, 3)]
                 side = "BUY"
             else:
-                sl   = max(max(x["h"] for x in rows[i - 12:i + 1]), price + 1.2 * a)
+                sl   = max(max(highs[i - 12:i + 1]), price + 1.2 * a)
                 risk = sl - price
                 tps  = [price - risk * k for k in (1, 2, 3)]
                 side = "SELL"
@@ -205,3 +201,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
     trades = backtest(rows)
     report(trades)
+                   
