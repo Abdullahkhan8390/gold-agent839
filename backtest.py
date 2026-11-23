@@ -199,7 +199,7 @@ def report(trades):
 
 
 if __name__ == "__main__":
-    rows = fetch_kraken(days=365)
+    rows = fetch_yahoo(days=730)
     if len(rows) < 300:
         print(f"Not enough data ({len(rows)} candles, need 300+)")
         raise SystemExit(1)
