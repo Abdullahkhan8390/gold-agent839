@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-agent.py v11 — calculation-based SL/TP
-Fix: reversal now uses H1 ATR (not M15) for SL sizing.
-A logical SL is sized to the volatility of the setup's timeframe.
+agent.py v11.2 — calculated SL/TP + chase filter
+Fix: late-entry detection. If price already moved >1x ATR in
+signal direction from H1 close, downgrade grade (chase = worse entry).
+Fix: tp1_r / tp2_r display.
 """
 import os, json, datetime, requests
 
@@ -12,39 +13,20 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 PIP = 0.10
 COOLDOWN_HOURS = 1
 MAX_HOURS_OPEN = 24
-MAX_SL_PIPS = 150              # ← Raised from 100 (per-type max clamps it)
+MAX_SL_PIPS = 150
 STATE_FILE = "signal_state.json"
 HEARTBEAT_HOURS = 4
 NEWS_BUFFER_MIN = 30
 DXY_CONFLICT_PCT = 0.4
 VOLUME_WEAK_RATIO = 0.8
 
-# ===== SL/TP CONFIG — per-type, ATR-scaled =====
 CFG = {
-    "scalp": {
-        "sl_mult": 1.2,          # × M15 ATR
-        "min_pips": 30,
-        "max_pips": 80,
-        "tp1_r": 1.0,
-        "tp2_r": 2.0,
-        "hold": "30m-4h",
-    },
-    "intraday": {
-        "sl_mult": 0.6,          # × H1 ATR
-        "min_pips": 50,
-        "max_pips": 120,
-        "tp1_r": 1.0,
-        "tp2_r": 2.0,
-        "hold": "4-24h",
-    },
-    "reversal": {
-        "sl_mult": 0.5,          # × H1 ATR (via ref_atr)
-        "min_pips": 50,
-        "max_pips": 130,
-        "tp1_r": 1.0,
-        "tp2_r": 2.0,
-        "hold": "1-6h",
-    },
+    "scalp":    {"sl_mult": 1.2, "min_pips": 30, "max_pips": 80,
+                 "tp1_r": 1.0, "tp2_r": 2.0, "hold": "30m-4h"},
+    "intraday": {"sl_mult": 0.6, "min_pips": 50, "max_pips": 120,
+                 "tp1_r": 1.0, "tp2_r": 2.0, "hold": "4-24h"},
+    "reversal": {"sl_mult": 0.5, "min_pips": 50, "max_pips": 130,
+                 "tp1_r": 1.0, "tp2_r": 2.0, "hold": "1-6h"},
 }
 
 
@@ -73,8 +55,7 @@ def fetch(interval, rng, symbol="GC=F", use_periods=False, server="query1"):
 def fetch_ohlc(interval, rng, symbol="GC=F", server="query1"):
     j = fetch(interval, rng, symbol, use_periods=True, server=server)
     res = (j.get("chart") or {}).get("result")
-    if not res:
-        return []
+    if not res: return []
     res = res[0]
     ts = res.get("timestamp") or []
     q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
@@ -102,8 +83,7 @@ def fetch_twelvedata(interval="1h", outputsize=500):
         j = r.json()
     except Exception:
         return []
-    if j.get("status") == "error" or "values" not in j:
-        return []
+    if j.get("status") == "error" or "values" not in j: return []
     rows = []
     for v in j["values"]:
         try:
@@ -185,14 +165,40 @@ def fetch_gc_volume_ratio():
         return None
 
 
-def grade_signal(sig, ctx):
-    score = 100; notes = []
+def grade_signal(sig, ctx, h1_close=None, ref_atr=None):
+    score = 100
+    notes = []
+    
+    # ===== CHASE CHECK =====
+    if h1_close is not None and ref_atr and ref_atr > 0:
+        if sig["side"] == "SHORT":
+            moved = h1_close - sig["entry"]
+        else:
+            moved = sig["entry"] - h1_close
+        moved_atr = moved / ref_atr
+        
+        if moved_atr > 1.5:
+            score -= 50
+            notes.append(f"🚫 Late chase {moved_atr:+.1f}×ATR past H1")
+        elif moved_atr > 1.0:
+            score -= 30
+            notes.append(f"⚠️ Late entry {moved_atr:+.1f}×ATR past H1")
+        elif moved_atr > 0.5:
+            score -= 15
+            notes.append(f"⚠️ Entry {moved_atr:+.1f}×ATR into move")
+        elif moved_atr < -0.3:
+            notes.append(f"✅ Pullback entry ({moved_atr:+.1f}×ATR)")
+        # -0.3 to +0.5 → no note, clean
+    
+    # ===== NEWS =====
     if not ctx["news_ok"]:
         score -= 50
         ne = ctx["news_event"] or {}
         mins = ne.get("in_min", 0)
         when = f"in {mins}min" if mins >= 0 else f"{abs(mins)}min ago"
         notes.append(f"🚫 News: {ne.get('title','?')} ({when})")
+    
+    # ===== DXY =====
     dxy = ctx.get("dxy_change_4h")
     if dxy is not None:
         if sig["side"] == "LONG" and dxy > DXY_CONFLICT_PCT:
@@ -201,6 +207,8 @@ def grade_signal(sig, ctx):
             score -= 25; notes.append(f"⚠️ DXY {dxy:.2f}% (against SHORT)")
         elif abs(dxy) >= DXY_CONFLICT_PCT:
             notes.append(f"✅ DXY {dxy:+.2f}% (aligned)")
+    
+    # ===== VOLUME =====
     if "breakout" in sig.get("why", "").lower():
         vr = ctx.get("volume_ratio")
         if vr is not None:
@@ -208,6 +216,7 @@ def grade_signal(sig, ctx):
                 score -= 15; notes.append(f"⚠️ Weak volume {vr}x")
             else:
                 notes.append(f"✅ Volume {vr}x")
+    
     if score >= 80: grade = "A"
     elif score >= 60: grade = "B"
     elif score >= 40: grade = "C"
@@ -334,16 +343,9 @@ def state(rows, label):
             "_bars": rows}
 
 
-# ==================== SIGNAL BUILDER (v11 CALCULATED SL/TP) ====================
+# ==================== BUILD ====================
 
 def build(kind, tf, side, why, ref_atr=None):
-    """
-    v11: SL is sized to the volatility of the setup's timeframe.
-    - ref_atr: override for ATR-based sizing (reversal passes H1 ATR)
-    - SL = max(ATR × sl_mult, structure + 0.3×ATR)
-    - Clamped to [min_pips, max_pips] per type
-    - TP1 = 1R, TP2 = tp2_r × risk
-    """
     cfg = CFG[kind]
     p = tf["price"]
     a = ref_atr if ref_atr else tf["atr"]
@@ -353,27 +355,19 @@ def build(kind, tf, side, why, ref_atr=None):
     min_dist = cfg["min_pips"] * PIP
     max_dist = cfg["max_pips"] * PIP
 
-    # Primary ATR-based distance
     atr_dist = sl_mult * a
-
-    # Structure-based distance (recent swing + 0.3×ATR buffer)
     struct_buf = 0.3 * a
     if side == "LONG":
         struct_dist = p - (tf["lo_prev"] - struct_buf)
     else:
         struct_dist = (tf["hi_prev"] + struct_buf) - p
 
-    # Use wider of the two, but never more than 2× ATR (avoid outlier)
     sl_dist = max(atr_dist, struct_dist)
     sl_dist = min(sl_dist, 2.0 * atr_dist)
     sl_dist = max(sl_dist, min_dist)
     sl_dist = min(sl_dist, max_dist)
 
-    if side == "LONG":
-        sl = p - sl_dist
-    else:
-        sl = p + sl_dist
-
+    sl = p - sl_dist if side == "LONG" else p + sl_dist
     risk = abs(p - sl)
     if risk < PIP * 20: return None
 
@@ -384,10 +378,12 @@ def build(kind, tf, side, why, ref_atr=None):
             "tp1": tp1, "tp2": tp2, "risk": risk,
             "why": why, "hold": cfg["hold"], "tf": tf["label"],
             "sl_pips": round(risk / PIP, 1),
-            "atr_used": a}
+            "atr_used": a,
+            "tp1_r": cfg["tp1_r"],
+            "tp2_r": cfg["tp2_r"]}
 
 
-# ==================== SIGNAL FINDERS ====================
+# ==================== FINDERS ====================
 
 def find_scalp(m, hh, h4s):
     if not m or len(m["_bars"]) < 25: return []
@@ -601,10 +597,12 @@ def fmt_signal(sig, notes=None):
     grade = sig.get("grade", "?")
     badge = {"A": "🏆 A", "B": "⚠️ B", "C": "🟡 C", "D": "⚪ D"}.get(grade, grade)
     atr_used = sig.get("atr_used", 0)
+    t1r = sig.get("tp1_r", 1.0)
+    t2r = sig.get("tp2_r", 2.0)
     body = (f"{arrow} @ {sig['entry']:.2f}  [{badge} · {sig.get('score','?')}]\n"
             f"  SL:  {sig['sl']:.2f}  ({pips:.0f}p / ${sig['risk']:.2f})\n"
-            f"  TP1: {sig['tp1']:.2f}  (1R · 50%, SL→BE)\n"
-            f"  TP2: {sig['tp2']:.2f}  ({sig.get('tp2_r','?')}R · rest)\n"
+            f"  TP1: {sig['tp1']:.2f}  ({t1r}R · 50%, SL→BE)\n"
+            f"  TP2: {sig['tp2']:.2f}  ({t2r}R · rest)\n"
             f"  Why: {sig['why']}\n"
             f"  ATR: {atr_used:.2f} · sized to {pips:.0f}p\n"
             f"  Hold: {sig['hold']} · {sig['tf']}")
@@ -669,7 +667,7 @@ def send_tg(text):
 # ==================== MAIN ====================
 
 def main():
-    print("=== agent.py v11 · calculated SL/TP (ATR-scaled per TF) ===")
+    print("=== agent.py v11.2 · calculated SL/TP + chase filter ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
@@ -689,10 +687,12 @@ def main():
         live_p = h1[-1]["c"]; live_src = f"{core_src}(close)"
     print(f"[live] {live_p:.2f} from {live_src}")
 
-    if abs(live_p - h1[-1]["c"]) > max(live_p * 0.01, 15.0):
-        msg = f"⚠️ ABORT — MISMATCH\nLive {live_p:.2f} vs H1 {h1[-1]['c']:.2f}"
+    h1_close = h1[-1]["c"]
+    gap = abs(live_p - h1_close)
+    if gap > max(live_p * 0.01, 15.0):
+        msg = f"⚠️ ABORT — MISMATCH\nLive {live_p:.2f} vs H1 {h1_close:.2f}"
         print(msg); send_tg(msg); return
-    print(f"[data] CLEAN · gap=${abs(live_p - h1[-1]['c']):.2f}")
+    print(f"[data] CLEAN · gap=${gap:.2f}")
 
     m15, m15_src = derive_m15()
 
@@ -713,7 +713,6 @@ def main():
     print(f"bias · M15={(m['bias'] if m else 0):+.2f} H1={hh['bias']:+.2f} "
           f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
 
-    # Filters
     print("[filters] Loading...")
     news_events = fetch_news_events()
     news_ok, news_event = check_news_blackout(now, news_events)
@@ -734,7 +733,6 @@ def main():
     for r in resolved:
         print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
 
-    # Signal finding — v11: reversal uses H1 ATR for SL sizing
     extreme = hh["rsi"] > 85 or hh["rsi"] < 15
     cands = []
 
@@ -766,7 +764,7 @@ def main():
 
     graded = []
     for name, emoji, sig in found:
-        g, sc, notes = grade_signal(sig, ctx)
+        g, sc, notes = grade_signal(sig, ctx, h1_close=h1_close, ref_atr=hh["atr"])
         sig["grade"] = g; sig["score"] = sc; sig["filter_notes"] = notes
         print(f"[grade] {name}: {g} ({sc}) {notes}")
         graded.append((name, emoji, sig, g))
