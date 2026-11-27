@@ -520,7 +520,13 @@ def check_open_signals(st, price, now):
         tp2 = sig["tp2"]
         risk = sig["risk"]
         tp1_done = sig.get("tp1_hit", False)
-        
+                # v11.4: Legacy migration — TP1 hit before BE fix existed
+        if tp1_done and not sig.get("sl_moved_to_be"):
+            sig["sl"] = entry
+            sig["sl_moved_to_be"] = True
+            sl = entry
+            print(f"[migration] {sig.get('id','?')} TP1 was hit before v11.3 → SL moved to BE {entry:.2f}")
+    
         # Expire check FIRST
         if age > sig.get("max_hours", MAX_HOURS_OPEN):
             if tp1_done:
