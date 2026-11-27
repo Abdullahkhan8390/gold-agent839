@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-agent.py v10.1 — Tier 1 retail: news + DXY + volume + grading
-Complete: all settings pre-configured. No manual edits needed.
-Fixes: reversal now fires at RSI 82-85 (was only >85).
+agent.py v11 — calculation-based SL/TP
+Fix: reversal now uses H1 ATR (not M15) for SL sizing.
+A logical SL is sized to the volatility of the setup's timeframe.
 """
 import os, json, datetime, requests
 
@@ -12,17 +12,39 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 PIP = 0.10
 COOLDOWN_HOURS = 1
 MAX_HOURS_OPEN = 24
-MAX_SL_PIPS = 100
+MAX_SL_PIPS = 150              # ← Raised from 100 (per-type max clamps it)
 STATE_FILE = "signal_state.json"
 HEARTBEAT_HOURS = 4
 NEWS_BUFFER_MIN = 30
 DXY_CONFLICT_PCT = 0.4
 VOLUME_WEAK_RATIO = 0.8
 
+# ===== SL/TP CONFIG — per-type, ATR-scaled =====
 CFG = {
-    "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m-4h"},
-    "fast":     {"sl": 0.50, "max_sl": 10.0, "hold": "1-6h"},
-    "intraday": {"sl": 0.65, "max_sl": 10.0, "hold": "4-24h"},
+    "scalp": {
+        "sl_mult": 1.2,          # × M15 ATR
+        "min_pips": 30,
+        "max_pips": 80,
+        "tp1_r": 1.0,
+        "tp2_r": 2.0,
+        "hold": "30m-4h",
+    },
+    "intraday": {
+        "sl_mult": 0.6,          # × H1 ATR
+        "min_pips": 50,
+        "max_pips": 120,
+        "tp1_r": 1.0,
+        "tp2_r": 2.0,
+        "hold": "4-24h",
+    },
+    "reversal": {
+        "sl_mult": 0.5,          # × H1 ATR (via ref_atr)
+        "min_pips": 50,
+        "max_pips": 130,
+        "tp1_r": 1.0,
+        "tp2_r": 2.0,
+        "hold": "1-6h",
+    },
 }
 
 
@@ -56,16 +78,12 @@ def fetch_ohlc(interval, rng, symbol="GC=F", server="query1"):
     res = res[0]
     ts = res.get("timestamp") or []
     q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
-    o = q.get("open") or []
-    h = q.get("high") or []
-    l = q.get("low") or []
-    c = q.get("close") or []
+    o = q.get("open") or []; h = q.get("high") or []
+    l = q.get("low") or [];  c = q.get("close") or []
     out = []
     for i in range(len(ts)):
-        if i >= len(c):
-            break
-        if None in (o[i], h[i], l[i], c[i]):
-            continue
+        if i >= len(c): break
+        if None in (o[i], h[i], l[i], c[i]): continue
         out.append({"t": int(ts[i]), "o": float(o[i]), "h": float(h[i]),
                     "l": float(l[i]), "c": float(c[i])})
     return out
@@ -73,8 +91,7 @@ def fetch_ohlc(interval, rng, symbol="GC=F", server="query1"):
 
 def fetch_twelvedata(interval="1h", outputsize=500):
     key = os.environ.get("TWELVEDATA_KEY")
-    if not key:
-        return []
+    if not key: return []
     try:
         r = requests.get(
             "https://api.twelvedata.com/time_series",
@@ -102,8 +119,7 @@ def fetch_twelvedata(interval="1h", outputsize=500):
 
 
 def closed_only(rows, tf_hours):
-    if not rows:
-        return rows
+    if not rows: return rows
     now_ts = datetime.datetime.now(UTC).timestamp()
     if now_ts - rows[-1]["t"] < tf_hours * 3600:
         return rows[:-1]
@@ -117,24 +133,19 @@ def fetch_news_events():
         r = requests.get(
             "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
             headers=UA, timeout=10)
-        if r.status_code != 200:
-            return []
+        if r.status_code != 200: return []
         events = r.json()
     except Exception:
         return []
     out = []
     for e in events:
         try:
-            if (e.get("country") or "").upper() not in ("USD", "US"):
-                continue
-            if (e.get("impact") or "").lower() != "high":
-                continue
-            date_str = (e.get("date") or "").strip()
-            if not date_str:
-                continue
-            dt = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
+            if (e.get("country") or "").upper() not in ("USD", "US"): continue
+            if (e.get("impact") or "").lower() != "high": continue
+            ds = (e.get("date") or "").strip()
+            if not ds: continue
+            dt = datetime.datetime.fromisoformat(ds.replace("Z", "+00:00"))
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=UTC)
             out.append({"title": (e.get("title") or "?")[:40], "dt": dt})
         except Exception:
             continue
@@ -143,10 +154,9 @@ def fetch_news_events():
 
 def check_news_blackout(now, events, buffer_min=NEWS_BUFFER_MIN):
     for e in events:
-        delta_sec = abs((now - e["dt"]).total_seconds())
-        if delta_sec < buffer_min * 60:
-            mins_away = int((e["dt"] - now).total_seconds() / 60)
-            return False, {"title": e["title"], "in_min": mins_away}
+        if abs((now - e["dt"]).total_seconds()) < buffer_min * 60:
+            mins = int((e["dt"] - now).total_seconds() / 60)
+            return False, {"title": e["title"], "in_min": mins}
     return True, None
 
 
@@ -154,13 +164,10 @@ def fetch_dxy_4h_change():
     try:
         j = fetch("1h", "5d", "DX-Y.NYB")
         res = (j.get("chart") or {}).get("result") or [{}]
-        res = res[0]
-        q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
-        c = q.get("close") or []
-        valid = [x for x in c if x is not None and x > 0]
-        if len(valid) < 5:
-            return None
-        return round((valid[-1] - valid[-5]) / valid[-5] * 100, 2)
+        q = ((res[0].get("indicators") or {}).get("quote") or [{}])[0]
+        c = [x for x in (q.get("close") or []) if x is not None and x > 0]
+        if len(c) < 5: return None
+        return round((c[-1] - c[-5]) / c[-5] * 100, 2)
     except Exception:
         return None
 
@@ -169,22 +176,17 @@ def fetch_gc_volume_ratio():
     try:
         j = fetch("1h", "5d", "GC=F")
         res = (j.get("chart") or {}).get("result") or [{}]
-        res = res[0]
-        q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
-        v = q.get("volume") or []
-        valid = [x for x in v if x is not None and x > 0]
-        if len(valid) < 21:
-            return None
-        last = valid[-1]
-        avg = sum(valid[-21:-1]) / 20
+        q = ((res[0].get("indicators") or {}).get("quote") or [{}])[0]
+        v = [x for x in (q.get("volume") or []) if x is not None and x > 0]
+        if len(v) < 21: return None
+        last = v[-1]; avg = sum(v[-21:-1]) / 20
         return round(last / avg, 2) if avg > 0 else None
     except Exception:
         return None
 
 
 def grade_signal(sig, ctx):
-    score = 100
-    notes = []
+    score = 100; notes = []
     if not ctx["news_ok"]:
         score -= 50
         ne = ctx["news_event"] or {}
@@ -194,19 +196,16 @@ def grade_signal(sig, ctx):
     dxy = ctx.get("dxy_change_4h")
     if dxy is not None:
         if sig["side"] == "LONG" and dxy > DXY_CONFLICT_PCT:
-            score -= 25
-            notes.append(f"⚠️ DXY +{dxy:.2f}% (against LONG)")
+            score -= 25; notes.append(f"⚠️ DXY +{dxy:.2f}% (against LONG)")
         elif sig["side"] == "SHORT" and dxy < -DXY_CONFLICT_PCT:
-            score -= 25
-            notes.append(f"⚠️ DXY {dxy:.2f}% (against SHORT)")
+            score -= 25; notes.append(f"⚠️ DXY {dxy:.2f}% (against SHORT)")
         elif abs(dxy) >= DXY_CONFLICT_PCT:
             notes.append(f"✅ DXY {dxy:+.2f}% (aligned)")
     if "breakout" in sig.get("why", "").lower():
         vr = ctx.get("volume_ratio")
         if vr is not None:
             if vr < VOLUME_WEAK_RATIO:
-                score -= 15
-                notes.append(f"⚠️ Weak volume {vr}x")
+                score -= 15; notes.append(f"⚠️ Weak volume {vr}x")
             else:
                 notes.append(f"✅ Volume {vr}x")
     if score >= 80: grade = "A"
@@ -216,23 +215,20 @@ def grade_signal(sig, ctx):
     return grade, score, notes
 
 
-# ==================== CORE TF DERIVATION ====================
+# ==================== TF DERIVATION ====================
 
 def derive_core_tfs():
     raw = fetch_twelvedata("1h", 5000)
     if raw and len(raw) >= 4000:
         raw = closed_only(raw, 1.0)
-        h1 = raw[-500:]
-        h4 = bucketed(raw, 4)
-        d1 = bucketed(raw, 24)
+        h1 = raw[-500:]; h4 = bucketed(raw, 4); d1 = bucketed(raw, 24)
         print(f"[core] TD 1h · {len(raw)} → H1={len(h1)} H4={len(h4)} D1={len(d1)}")
         return h1, h4, d1, "TwelveData 1h"
     raw = fetch_ohlc("1h", "60d")
     if raw and len(raw) >= 400:
         raw = closed_only(raw, 1.0)
         h1 = raw[-500:] if len(raw) > 500 else raw
-        h4 = bucketed(raw, 4)
-        d1 = bucketed(raw, 24)
+        h4 = bucketed(raw, 4); d1 = bucketed(raw, 24)
         print(f"[core] Yahoo 1h · {len(raw)}")
         return h1, h4, d1, "Yahoo 1h"
     return [], [], [], None
@@ -257,11 +253,9 @@ def get_live_quote():
         try:
             r = requests.get("https://api.twelvedata.com/price",
                 params={"symbol": "XAU/USD",
-                        "apikey": os.environ["TWELVEDATA_KEY"]},
-                timeout=15)
+                        "apikey": os.environ["TWELVEDATA_KEY"]}, timeout=15)
             p = float(r.json().get("price", 0))
-            if p > 0:
-                return p, "TwelveData"
+            if p > 0: return p, "TwelveData"
         except Exception:
             pass
     for name, url in [
@@ -272,16 +266,14 @@ def get_live_quote():
             r = requests.get(url, headers=UA, timeout=15)
             res = ((r.json().get("chart") or {}).get("result") or [{}])[0]
             p = (res.get("meta") or {}).get("regularMarketPrice")
-            if p:
-                return float(p), name
+            if p: return float(p), name
         except Exception:
             continue
     return None, None
 
 
 def bucketed(rows, hours):
-    sec = hours * 3600
-    b = {}
+    sec = hours * 3600; b = {}
     for r in rows:
         k = r["t"] // sec
         if k not in b:
@@ -297,96 +289,105 @@ def bucketed(rows, hours):
 
 def ema(vals, n):
     n = max(2, min(n, len(vals)))
-    k = 2.0 / (n + 1)
-    e = vals[0]
-    out = [e]
+    k = 2.0 / (n + 1); e = vals[0]; out = [e]
     for v in vals[1:]:
-        e = v * k + e * (1 - k)
-        out.append(e)
+        e = v * k + e * (1 - k); out.append(e)
     return out
 
 
 def rsi_last(vals, n=14):
-    if len(vals) < n + 1:
-        return 50.0
-    seg = vals[-(n + 1):]
-    g, l = 0.0, 0.0
+    if len(vals) < n + 1: return 50.0
+    seg = vals[-(n + 1):]; g = 0.0; l = 0.0
     for i in range(1, len(seg)):
         d = seg[i] - seg[i - 1]
         if d > 0: g += d
         else: l += -d
-    if l == 0:
-        return 100.0
+    if l == 0: return 100.0
     return 100 - 100 / (1 + g / l)
 
 
 def atr_last(hs, ls, cs, n=14):
-    if len(cs) < n + 1:
-        return 0.0
+    if len(cs) < n + 1: return 0.0
     trs = []
     for i in range(len(cs) - n, len(cs)):
-        trs.append(max(hs[i] - ls[i],
-                       abs(hs[i] - cs[i - 1]),
-                       abs(ls[i] - cs[i - 1])))
+        trs.append(max(hs[i] - ls[i], abs(hs[i] - cs[i - 1]), abs(ls[i] - cs[i - 1])))
     return sum(trs) / len(trs)
 
 
 def state(rows, label):
-    if len(rows) < 60:
-        return None
+    if len(rows) < 60: return None
     closes = [r["c"] for r in rows]
     highs = [r["h"] for r in rows]
     lows = [r["l"] for r in rows]
     p = closes[-1]
-    e20 = ema(closes, 20)[-1]
-    e50 = ema(closes, 50)[-1]
-    e200 = ema(closes, 200)[-1]
+    e20 = ema(closes, 20)[-1]; e50 = ema(closes, 50)[-1]; e200 = ema(closes, 200)[-1]
     rv = rsi_last(closes)
     a = atr_last(highs, lows, closes) or max(p * 0.0005, 0.01)
     score = 0
     score += 1 if p > e200 else -1
     score += 1 if e20 > e50 else -1
     score += 1 if p > e20 else -1
-    return {"label": label, "price": p,
-            "e20": e20, "e50": e50, "e200": e200,
+    return {"label": label, "price": p, "e20": e20, "e50": e50, "e200": e200,
             "rsi": rv, "atr": a, "bias": score / 3.0,
             "hi_prev": max(highs[-21:-1]) if len(highs) > 21 else max(highs),
             "lo_prev": min(lows[-21:-1]) if len(lows) > 21 else min(lows),
             "_bars": rows}
 
 
-# ==================== SIGNAL BUILDERS ====================
+# ==================== SIGNAL BUILDER (v11 CALCULATED SL/TP) ====================
 
-def build(kind, tf, side, why):
-    cfg = CFG[kind]; p = tf["price"]; a = tf["atr"]; mx = cfg["max_sl"]
+def build(kind, tf, side, why, ref_atr=None):
+    """
+    v11: SL is sized to the volatility of the setup's timeframe.
+    - ref_atr: override for ATR-based sizing (reversal passes H1 ATR)
+    - SL = max(ATR × sl_mult, structure + 0.3×ATR)
+    - Clamped to [min_pips, max_pips] per type
+    - TP1 = 1R, TP2 = tp2_r × risk
+    """
+    cfg = CFG[kind]
+    p = tf["price"]
+    a = ref_atr if ref_atr else tf["atr"]
+    if a <= 0: return None
+
+    sl_mult = cfg["sl_mult"]
+    min_dist = cfg["min_pips"] * PIP
+    max_dist = cfg["max_pips"] * PIP
+
+    # Primary ATR-based distance
+    atr_dist = sl_mult * a
+
+    # Structure-based distance (recent swing + 0.3×ATR buffer)
+    struct_buf = 0.3 * a
     if side == "LONG":
-        sl_a = p - cfg["sl"] * a
-        sl_s = tf["lo_prev"] - 0.10 * a
-        sl = max(sl_a, sl_s) if sl_s < p else sl_a
-        if p - sl < 0.20 * a: sl = p - 0.20 * a
-        if p - sl > mx: sl = p - mx
-        risk = p - sl
-        if risk <= 0.05: return None
-        if risk / PIP > MAX_SL_PIPS:
-            print(f"[build] reject {side} {kind}: {risk/PIP:.0f}p")
-            return None
-        tp1 = p + risk; tp2 = p + risk * 2
+        struct_dist = p - (tf["lo_prev"] - struct_buf)
     else:
-        sl_a = p + cfg["sl"] * a
-        sl_s = tf["hi_prev"] + 0.10 * a
-        sl = min(sl_a, sl_s) if sl_s > p else sl_a
-        if sl - p < 0.20 * a: sl = p + 0.20 * a
-        if sl - p > mx: sl = p + mx
-        risk = sl - p
-        if risk <= 0.05: return None
-        if risk / PIP > MAX_SL_PIPS:
-            print(f"[build] reject {side} {kind}: {risk/PIP:.0f}p")
-            return None
-        tp1 = p - risk; tp2 = p - risk * 2
+        struct_dist = (tf["hi_prev"] + struct_buf) - p
+
+    # Use wider of the two, but never more than 2× ATR (avoid outlier)
+    sl_dist = max(atr_dist, struct_dist)
+    sl_dist = min(sl_dist, 2.0 * atr_dist)
+    sl_dist = max(sl_dist, min_dist)
+    sl_dist = min(sl_dist, max_dist)
+
+    if side == "LONG":
+        sl = p - sl_dist
+    else:
+        sl = p + sl_dist
+
+    risk = abs(p - sl)
+    if risk < PIP * 20: return None
+
+    tp1 = p + risk * cfg["tp1_r"] if side == "LONG" else p - risk * cfg["tp1_r"]
+    tp2 = p + risk * cfg["tp2_r"] if side == "LONG" else p - risk * cfg["tp2_r"]
+
     return {"kind": kind, "side": side, "entry": p, "sl": sl,
             "tp1": tp1, "tp2": tp2, "risk": risk,
-            "why": why, "hold": cfg["hold"], "tf": tf["label"]}
+            "why": why, "hold": cfg["hold"], "tf": tf["label"],
+            "sl_pips": round(risk / PIP, 1),
+            "atr_used": a}
 
+
+# ==================== SIGNAL FINDERS ====================
 
 def find_scalp(m, hh, h4s):
     if not m or len(m["_bars"]) < 25: return []
@@ -547,8 +548,7 @@ def check_open_signals(st, price, now):
         st["history"].append(sig)
         r = sig["result"]
         if r in ("WIN", "LOSS", "EXPIRED", "BREAKEVEN"):
-            key = {"WIN": "wins", "LOSS": "losses",
-                   "EXPIRED": "expired", "BREAKEVEN": "breakeven"}[r]
+            key = {"WIN":"wins","LOSS":"losses","EXPIRED":"expired","BREAKEVEN":"breakeven"}[r]
             st["stats"][key] += 1
         st["stats"]["total"] += 1
         st["stats"]["total_pips"] = round(st["stats"]["total_pips"] + sig.get("pips", 0), 1)
@@ -600,11 +600,13 @@ def fmt_signal(sig, notes=None):
     arrow = "🟢 BUY" if sig["side"] == "LONG" else "🔴 SELL"
     grade = sig.get("grade", "?")
     badge = {"A": "🏆 A", "B": "⚠️ B", "C": "🟡 C", "D": "⚪ D"}.get(grade, grade)
+    atr_used = sig.get("atr_used", 0)
     body = (f"{arrow} @ {sig['entry']:.2f}  [{badge} · {sig.get('score','?')}]\n"
             f"  SL:  {sig['sl']:.2f}  ({pips:.0f}p / ${sig['risk']:.2f})\n"
             f"  TP1: {sig['tp1']:.2f}  (1R · 50%, SL→BE)\n"
-            f"  TP2: {sig['tp2']:.2f}  (2R · rest)\n"
+            f"  TP2: {sig['tp2']:.2f}  ({sig.get('tp2_r','?')}R · rest)\n"
             f"  Why: {sig['why']}\n"
+            f"  ATR: {atr_used:.2f} · sized to {pips:.0f}p\n"
             f"  Hold: {sig['hold']} · {sig['tf']}")
     if notes:
         body += "\n  " + "\n  ".join(notes)
@@ -642,12 +644,9 @@ def fmt_open(st):
 
 
 def send_tg(text):
-    pairs = [("TG_TOKEN", "TG_CHAT"),
-             ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"),
-             ("TELEGRAM_TOKEN", "TELEGRAM_CHAT"),
-             ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"),
-             ("TELEGRAM_BOT_TOKEN", "CHAT_ID"),
-             ("BOT_TOKEN", "CHAT_ID")]
+    pairs = [("TG_TOKEN","TG_CHAT"), ("TELEGRAM_TOKEN","TELEGRAM_CHAT_ID"),
+             ("TELEGRAM_TOKEN","TELEGRAM_CHAT"), ("TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"),
+             ("TELEGRAM_BOT_TOKEN","CHAT_ID"), ("BOT_TOKEN","CHAT_ID")]
     tk = ck = None
     for a, b in pairs:
         if os.environ.get(a) and os.environ.get(b):
@@ -660,10 +659,8 @@ def send_tg(text):
     except Exception: pass
     if not tk: return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{os.environ[tk]}/sendMessage",
-            data={"chat_id": os.environ[ck], "text": text},
-            timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{os.environ[tk]}/sendMessage",
+                          data={"chat_id": os.environ[ck], "text": text}, timeout=15)
         print(f"[tg] {tk} → {r.status_code}")
     except Exception as e:
         print(f"[tg] {e}")
@@ -672,13 +669,12 @@ def send_tg(text):
 # ==================== MAIN ====================
 
 def main():
-    print("=== agent.py v10.1 · complete Tier 1 package ===")
+    print("=== agent.py v11 · calculated SL/TP (ATR-scaled per TF) ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
     if now.weekday() >= 5:
-        print(f"[skip] {now_pkt} weekend")
-        return
+        print(f"[skip] {now_pkt} weekend"); return
 
     print(f"[env] TD={'✓' if os.environ.get('TWELVEDATA_KEY') else '❌'} · "
           f"TG={'✓' if os.environ.get('TELEGRAM_TOKEN') else '❌'}")
@@ -701,9 +697,7 @@ def main():
     m15, m15_src = derive_m15()
 
     S = {"m15": state(m15, "M15") if m15 else None,
-         "h1": state(h1, "H1"),
-         "h4": state(h4, "H4"),
-         "d1": state(d1r, "D1")}
+         "h1": state(h1, "H1"), "h4": state(h4, "H4"), "d1": state(d1r, "D1")}
     if not (S["h1"] and S["h4"] and S["d1"]):
         msg = "🚨 GOLD ABORT\nState failed."
         print(msg); send_tg(msg); return
@@ -713,7 +707,8 @@ def main():
         if tf is not None: tf["price"] = live_p
     spot = live_p
 
-    print(f"[main] H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
+    print(f"[main] H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}  "
+          f"(M15 ATR={(m['atr'] if m else 0):.2f})")
     print(f"[main] D1 close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f}")
     print(f"bias · M15={(m['bias'] if m else 0):+.2f} H1={hh['bias']:+.2f} "
           f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
@@ -739,7 +734,7 @@ def main():
     for r in resolved:
         print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
 
-    # Signal finding — v10.1: reversal checked in BOTH branches
+    # Signal finding — v11: reversal uses H1 ATR for SL sizing
     extreme = hh["rsi"] > 85 or hh["rsi"] < 15
     cands = []
 
@@ -747,12 +742,12 @@ def main():
         print(f"[gate] RSI {hh['rsi']:.0f} EXTREME → reversal only")
         if m:
             for side, why in find_reversal(m, hh, h4s, dd):
-                b = build("scalp", m, side, why)
+                b = build("reversal", m, side, why, ref_atr=hh["atr"])
                 if b: cands.append(("🔄 REVERSAL", "🔄", b))
         if not cands:
             print("[gate] no reversal confirmation")
     else:
-        print(f"[gate] RSI {hh['rsi']:.0f} → normal mode (scalp+intraday+reversal)")
+        print(f"[gate] RSI {hh['rsi']:.0f} → normal mode")
         if m:
             for side, why in find_scalp(m, hh, h4s):
                 b = build("scalp", m, side, why)
@@ -760,17 +755,15 @@ def main():
         for side, why in find_intraday(hh, h4s):
             b = build("intraday", hh, side, why)
             if b: cands.append(("🎯 INTRADAY", "🎯", b))
-        # v10.1: reversal also here (catches RSI 82-85 / 15-18)
         if m:
             for side, why in find_reversal(m, hh, h4s, dd):
-                b = build("scalp", m, side, why)
+                b = build("reversal", m, side, why, ref_atr=hh["atr"])
                 if b: cands.append(("🔄 REVERSAL", "🔄", b))
         print(f"candidates={len(cands)}")
 
     found = filter_cooldown(cands, st)
     print(f"after filter={len(found)}")
 
-    # Grade
     graded = []
     for name, emoji, sig in found:
         g, sc, notes = grade_signal(sig, ctx)
@@ -792,8 +785,7 @@ def main():
         print(f"\n{n} — {fmt_signal(s, s.get('filter_notes'))}")
 
     if not to_fire and not resolved:
-        last_hb = st.get("last_heartbeat")
-        should_hb = True
+        last_hb = st.get("last_heartbeat"); should_hb = True
         if last_hb:
             try:
                 lt = datetime.datetime.fromisoformat(last_hb)
@@ -801,72 +793,48 @@ def main():
                 if (now - lt).total_seconds() < HEARTBEAT_HOURS * 3600:
                     should_hb = False
             except Exception: pass
-
         send_c = False
         if c_blocked:
-            last_c = st.get("last_c_warning")
-            send_c = True
+            last_c = st.get("last_c_warning"); send_c = True
             if last_c:
                 try:
                     lt = datetime.datetime.fromisoformat(last_c)
                     if lt.tzinfo is None: lt = lt.replace(tzinfo=UTC)
-                    if (now - lt).total_seconds() < 3600:
-                        send_c = False
+                    if (now - lt).total_seconds() < 3600: send_c = False
                 except Exception: pass
-
         if send_c:
             n, e, s = c_blocked[0]
             msg = (f"🟡 SIGNAL FILTERED [{s.get('grade','?')} · {s.get('score','?')}]\n"
                    f"Would fire: {'🟢 BUY' if s['side']=='LONG' else '🔴 SELL'} "
-                   f"@ {s['entry']:.2f}\n"
-                   f"Why: {s['why']}\n")
-            for note in s.get("filter_notes", []):
-                msg += f"  {note}\n"
+                   f"@ {s['entry']:.2f}\nWhy: {s['why']}\n")
+            for note in s.get("filter_notes", []): msg += f"  {note}\n"
             msg += f"\n⏰ {now_pkt}"
-            send_tg(msg)
-            st["last_c_warning"] = now.isoformat()
-            save_state(st)
-            print("→ filtered-warning sent")
-            return
-
+            send_tg(msg); st["last_c_warning"] = now.isoformat()
+            save_state(st); print("→ filtered-warning sent"); return
         if should_hb:
-            lines = [
-                "⏸ GOLD — No signal",
-                f"⏰ {now_pkt}",
-                f"💰 Spot: {spot:.2f}",
-                "",
-                "📊 Market:",
-                f"  H1 RSI: {hh['rsi']:.0f}",
-                f"  H1 bias: {hh['bias']:+.2f}",
-                f"  H4 bias: {h4s['bias']:+.2f}",
-                f"  D1 bias: {dd['bias']:+.2f}",
-                "",
-                "🔍 Filters:",
-                f"  News: {'🚫' if not news_ok else '✅ clear'}",
-                f"  DXY: {dxy_change if dxy_change is not None else 'N/A'}%",
-                f"  Volume: {volume_ratio if volume_ratio is not None else 'N/A'}x",
-            ]
+            lines = ["⏸ GOLD — No signal", f"⏰ {now_pkt}", f"💰 Spot: {spot:.2f}", "",
+                     "📊 Market:",
+                     f"  H1 RSI: {hh['rsi']:.0f}  ATR: {hh['atr']:.2f}",
+                     f"  H1 bias: {hh['bias']:+.2f}",
+                     f"  H4 bias: {h4s['bias']:+.2f}",
+                     f"  D1 bias: {dd['bias']:+.2f}", "",
+                     "🔍 Filters:",
+                     f"  News: {'🚫' if not news_ok else '✅ clear'}",
+                     f"  DXY: {dxy_change if dxy_change is not None else 'N/A'}%",
+                     f"  Volume: {volume_ratio if volume_ratio is not None else 'N/A'}x"]
             if hh["rsi"] > 85:
-                lines.append("")
-                lines.append("⚠️ H1 overbought · reversal-only mode")
-                if not news_ok:
-                    lines.append(f"   🚫 {news_event['title']}")
+                lines += ["", "⚠️ H1 overbought · reversal-only"]
+                if not news_ok: lines.append(f"   🚫 {news_event['title']}")
                 elif not (h4s["bias"] <= -0.25 and dd["bias"] <= -0.25):
                     lines.append("   Waiting H4/D1 bearish align")
                 else:
                     lines.append("   Waiting M15 trigger")
-            elif hh["rsi"] >= 82:
-                lines.append("")
-                lines.append("⚠️ H1 near-extreme · reversal watching")
-            elif hh["rsi"] < 18:
-                lines.append("")
-                lines.append("⚠️ H1 oversold · reversal watching")
+            elif hh["rsi"] >= 82: lines += ["", "⚠️ Near-extreme · watching"]
+            elif hh["rsi"] < 18:  lines += ["", "⚠️ Oversold · watching"]
             send_tg("\n".join(lines))
             st["last_heartbeat"] = now.isoformat()
-            save_state(st)
-            print("→ heartbeat sent")
-        else:
-            print("quiet")
+            save_state(st); print("→ heartbeat sent")
+        else: print("quiet")
         return
 
     parts = []
