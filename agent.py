@@ -19,7 +19,7 @@ MAX_AGE_D1_H  = 72.0
 CFG = {
     "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m–4h"},
     "fast":     {"sl": 0.50, "max_sl": 10.0, "hold": "1–6h"},
-    "intraday": {"sl": 0.65, "max_sl": 12.0, "hold": "4–24h"},
+    "intraday": {"sl": 0.65, "max_sl": 10.0, "hold": "4–24h"},
 }
 
 
@@ -264,6 +264,7 @@ def build(kind, tf, side, why):
         if p - sl > mx: sl = p - mx
         risk = p - sl
         if risk <= 0.05: return None
+        if risk / PIP > 100: return None      # ← HARD CAP
         tp1 = p + risk; tp2 = p + risk*2
     else:
         sl_a = p + cfg["sl"]*a
@@ -273,6 +274,7 @@ def build(kind, tf, side, why):
         if sl - p > mx: sl = p + mx
         risk = sl - p
         if risk <= 0.05: return None
+        if risk / PIP > 100: return None      # ← HARD CAP
         tp1 = p - risk; tp2 = p - risk*2
     return {"kind": kind, "side": side, "entry": p, "sl": sl,
             "tp1": tp1, "tp2": tp2, "risk": risk,
@@ -436,6 +438,7 @@ def check_open_signals(st, price, now):
 
 
 def filter_cooldown(cands, st):
+    """Cooldown filter + SL hard-cap + picks top-1 signal only."""
     now = datetime.datetime.now(UTC); out = []; seen = set()
     for name, emoji, sig in cands:
         k = (sig["side"], round(sig["entry"],1))
@@ -451,7 +454,31 @@ def filter_cooldown(cands, st):
             except Exception: pass
         if blocked: continue
         seen.add(k); out.append((name, emoji, sig))
-    return out
+
+    # Reject any signal with SL > 100 pips
+    before = len(out)
+    out = [c for c in out if c[2]["risk"] / PIP <= 100]
+    if len(out) < before:
+        print(f"[filter] rejected {before - len(out)} over-cap SL")
+
+    if not out:
+        return []
+
+    # If contradictory directions → keep best only
+    sides = set(c[2]["side"] for c in out)
+    if len(sides) > 1:
+        def score(c):
+            pips = c[2]["risk"] / PIP
+            s = 200 - pips
+            if "confluence" in c[2]["why"].lower(): s += 30
+            if "overbought" in c[2]["why"].lower() or "oversold" in c[2]["why"].lower(): s += 20
+            return s
+        print(f"[filter] contradictory directions → pick best of {len(out)}")
+        return [max(out, key=score)]
+
+    # Same direction — max 1 per cycle
+    return out[:1]
+
 
 
 # ══════════ FORMAT ══════════
@@ -525,15 +552,19 @@ def send_tg(text):
 
 # ══════════ MAIN ══════════
 def main():
-    print("=== agent.py v4 · timezone fixed + spot-first ===")
+    print("=== agent.py v5 · contradictory-safe ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
     if now.weekday() >= 5:
         print(f"[skip] {now_pkt} — weekend"); return
 
     td = os.environ.get("TWELVEDATA_KEY")
-    print(f"[env] TWELVEDATA_KEY={'✓' if td else '❌'} · "
-          f"TG_TOKEN={'✓' if os.environ.get('TG_TOKEN') else '❌'}")
+    tg_ok = any(os.environ.get(tk) and os.environ.get(ck)
+                for tk, ck in [("TG_TOKEN","TG_CHAT"),
+                               ("TELEGRAM_TOKEN","TELEGRAM_CHAT_ID"),
+                               ("TELEGRAM_TOKEN","TELEGRAM_CHAT"),
+                               ("TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID")])
+    print(f"[env] TWELVEDATA_KEY={'✓' if td else '❌'} · TG={'✓' if tg_ok else '❌'}")
 
     h1, h1_src = derive_h1()
     if not h1 or len(h1) < 100:
@@ -545,37 +576,32 @@ def main():
         msg = "🚨 GOLD ABORT\nD1 staled."
         print(msg); send_tg(msg); return
 
+    # ── D1 source consistency: spot must match spot ──
+    if "TwelveData" in h1_src and "GC=F" in d1_src:
+        td_d1 = fetch_twelvedata("1day", 500)
+        if td_d1 and len(td_d1) >= 100:
+            d1r = td_d1
+            d1_src = "TwelveData 1day"
+            print(f"[d1] → TwelveData (source consistency)")
+
     print(f"[main] H1={h1_src} · {len(h1)} bars · close={h1[-1]['c']:.2f}")
     print(f"[main] D1={d1_src} · close={d1r[-1]['c']:.2f}")
 
     h4 = bucketed(h1, 4)
     m15, m15_src = derive_m15()
 
-    # Live price: prefer TD spot XAU/USD to match H1 source
     live_p, live_age, live_src = get_live_quote(prefer_td=True)
     if live_p is None:
         live_p = h1[-1]["c"]; live_src = f"{h1_src}(close)"
-        print(f"[live] fallback to H1 close")
     print(f"[live] {live_p:.2f} from {live_src}")
 
-    # Gap check: only compare if live is non-TD (cross-instrument risk)
-    # If both H1 and live are TwelveData spot → gap should be tiny
-    if live_src == "TwelveData" and "TwelveData" in h1_src:
-        # Same source — tight tolerance
-        gap = abs(live_p - h1[-1]["c"])
-        limit = max(live_p * 0.001, 1.0)     # 0.1% or $1
-        print(f"[data] same-source (spot-spot) · gap=${gap:.2f} limit=${limit:.2f}")
-    else:
-        # Mixed spot vs futures — wider tolerance
-        gap = abs(live_p - h1[-1]["c"])
-        limit = max(live_p * 0.008, 25.0)    # 0.8% or $25
-        print(f"[data] mixed-source (spot/fut) · gap=${gap:.2f} limit=${limit:.2f}")
-
+    gap = abs(live_p - h1[-1]["c"])
+    limit = max(live_p * 0.003, 3.0)
     if gap > limit:
         msg = (f"⚠️ GOLD ABORT — PRICE MISMATCH\n"
-               f"Live:  {live_p:.2f} ({live_src})\n"
-               f"H1:    {h1[-1]['c']:.2f} ({h1_src})\n"
-               f"Gap:   ${gap:.2f} > ${limit:.2f}")
+               f"Live: {live_p:.2f} ({live_src})\n"
+               f"H1:   {h1[-1]['c']:.2f} ({h1_src})\n"
+               f"Gap:  ${gap:.2f} > ${limit:.2f}")
         print(msg); send_tg(msg); return
     print(f"[data] CLEAN · gap=${gap:.2f}")
 
@@ -600,21 +626,26 @@ def main():
     for r in resolved:
         print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
 
-    cands = []
-    if m:
-        for side, why in find_scalp(m, hh, h4s):
-            b = build("scalp", m, side, why)
-            if b: cands.append(("⚡ SCALP", "⚡", b))
-        for side, why in find_fast(m, hh):
-            b = build("fast", m, side, why)
-            if b: cands.append(("💨 FAST", "💨", b))
-    for side, why in find_intraday(hh, h4s):
-        b = build("intraday", hh, side, why)
-        if b: cands.append(("🎯 INTRADAY", "🎯", b))
-    print(f"candidates={len(cands)}")
+    # ── H1 RSI extreme gate: skip all new signals if exhausted ──
+    if hh["rsi"] > 90 or hh["rsi"] < 10:
+        print(f"[skip] H1 RSI {hh['rsi']:.0f} — extreme, no new signals")
+        cands = []
+    else:
+        cands = []
+        if m:
+            for side, why in find_scalp(m, hh, h4s):
+                b = build("scalp", m, side, why)
+                if b: cands.append(("⚡ SCALP", "⚡", b))
+            for side, why in find_fast(m, hh):
+                b = build("fast", m, side, why)
+                if b: cands.append(("💨 FAST", "💨", b))
+        for side, why in find_intraday(hh, h4s):
+            b = build("intraday", hh, side, why)
+            if b: cands.append(("🎯 INTRADAY", "🎯", b))
+        print(f"candidates={len(cands)}")
 
     found = filter_cooldown(cands, st)
-    print(f"after cooldown={len(found)}")
+    print(f"after filter={len(found)}")
 
     for name, emoji, sig in found:
         sid = f"{sig['side'][0]}{now.strftime('%Y%m%d%H%M%S')}"
@@ -629,8 +660,8 @@ def main():
 
     parts = []
     if found:
-        head = f"🥇 GOLD SIGNAL{'S' if len(found)>1 else ''} — {now_pkt}\nSpot: {spot:.2f}"
-        body = "\n\n".join(f"{n}\n{fmt_signal(s)}" for n,e,s in found[:5])
+        head = f"🥇 GOLD — {now_pkt}\nSpot: {spot:.2f}"
+        body = "\n\n".join(f"{n}\n{fmt_signal(s)}" for n,e,s in found)
         parts.append(f"{head}\n\n{body}")
     if resolved: parts.append(fmt_prev(resolved))
     if found: parts.append(fmt_open(st))
@@ -639,6 +670,3 @@ def main():
     send_tg("\n\n".join(p for p in parts if p))
     print("→ processed")
 
-
-if __name__ == "__main__":
-    main()
