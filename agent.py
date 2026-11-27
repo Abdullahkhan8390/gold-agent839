@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent.py v6 — closed-candle indicators, no fake RSI, no fake D1 bias
+agent.py v7 — closed candles + reversal mode + heartbeat + D1 fix
 """
 import os, json, datetime, requests
 
@@ -15,6 +15,7 @@ STATE_FILE = "signal_state.json"
 MAX_AGE_M15_H = 1.0
 MAX_AGE_H1_H  = 3.0
 MAX_AGE_D1_H  = 72.0
+HEARTBEAT_HOURS = 4
 
 CFG = {
     "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m-4h"},
@@ -23,7 +24,6 @@ CFG = {
 }
 
 
-# ========== DATA SOURCES ==========
 def fetch(interval, rng, symbol="GC=F", use_periods=False, server="query1"):
     url = f"https://{server}.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval}
@@ -97,7 +97,6 @@ def fetch_twelvedata(interval="1h", outputsize=500):
 
 
 def closed_only(rows, tf_hours):
-    """Drop the last bar if it's still forming (close not final)."""
     if not rows:
         return rows
     now_ts = datetime.datetime.now(UTC).timestamp()
@@ -206,7 +205,6 @@ def get_live_quote(prefer_td=True):
     return None, None, None
 
 
-# ========== HELPERS ==========
 def bucketed(rows, hours):
     sec = hours * 3600
     b = {}
@@ -330,7 +328,6 @@ def build(kind, tf, side, why):
             "why": why, "hold": cfg["hold"], "tf": tf["label"]}
 
 
-# ========== SETUPS ==========
 def find_scalp(m, hh, h4s):
     if not m or len(m["_bars"]) < 25:
         return []
@@ -372,17 +369,6 @@ def find_scalp(m, hh, h4s):
             out.append(("SHORT", f"M15 overbought (RSI {rsi:.0f})"))
         if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3 and lbe:
             out.append(("SHORT", "H1+H4 bear confluence"))
-    if len(bars) >= 24:
-        rl = min(b["l"] for b in bars[-21:-3])
-        rh = max(b["h"] for b in bars[-21:-3])
-        for b in bars[-3:]:
-            if b["l"] < rl and b["c"] > rl and hh["bias"] >= 0:
-                out.append(("LONG", f"M15 swept {rl:.2f}"))
-                break
-        for b in bars[-3:]:
-            if b["h"] > rh and b["c"] < rh and hh["bias"] <= 0:
-                out.append(("SHORT", f"M15 swept {rh:.2f}"))
-                break
     return out
 
 
@@ -399,12 +385,6 @@ def find_fast(m, hh):
         out.append(("LONG", f"M15 thrust ({body/a:.1f}xATR)"))
     if last["c"] < last["o"] and body > 0.55 * a and hh["bias"] <= 0:
         out.append(("SHORT", f"M15 thrust ({body/a:.1f}xATR)"))
-    if (last["c"] > last["o"] and prev["c"] < prev["o"]
-            and last["c"] > prev["o"] and last["o"] < prev["c"]):
-        out.append(("LONG", "M15 bull engulfing"))
-    if (last["c"] < last["o"] and prev["c"] > prev["o"]
-            and last["c"] < prev["o"] and last["o"] > prev["c"]):
-        out.append(("SHORT", "M15 bear engulfing"))
     return out
 
 
@@ -434,8 +414,6 @@ def find_intraday(hh, h4s):
             out.append(("LONG", "H1 2-bar bull"))
         if rsi < 32:
             out.append(("LONG", f"H1 oversold (RSI {rsi:.0f})"))
-        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3:
-            out.append(("LONG", "H1+H4 bull confluence"))
     if hh["bias"] <= 0 or h4s["bias"] <= 0:
         if lbe and body > 0.35 * a and rsi > 24:
             out.append(("SHORT", f"H1 momentum (RSI {rsi:.0f})"))
@@ -447,27 +425,36 @@ def find_intraday(hh, h4s):
             out.append(("SHORT", "H1 2-bar bear"))
         if rsi > 68:
             out.append(("SHORT", f"H1 overbought (RSI {rsi:.0f})"))
-        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3:
-            out.append(("SHORT", "H1+H4 bear confluence"))
-    if len(bars) >= 24:
-        rl = min(b["l"] for b in bars[-21:-3])
-        rh = max(b["h"] for b in bars[-21:-3])
-        for b in bars[-3:]:
-            if b["l"] < rl and b["c"] > rl:
-                out.append(("LONG", f"H1 swept {rl:.2f}"))
-                break
-        for b in bars[-3:]:
-            if b["h"] > rh and b["c"] < rh:
-                out.append(("SHORT", f"H1 swept {rh:.2f}"))
-                break
     return out
 
 
-# ========== STATE + TRACKING ==========
+def find_reversal(m, hh, h4s, dd):
+    """Extreme H1 RSI + H4/D1 confluence + M15 trigger candle."""
+    if not m or len(m["_bars"]) < 5:
+        return []
+    bars = m["_bars"]
+    last = bars[-1]
+    recent = bars[-3:]
+    body_last = abs(last["c"] - last["o"]) or 0.01
+    upper_wick = last["h"] - max(last["c"], last["o"])
+    lower_wick = min(last["c"], last["o"]) - last["l"]
+    any_bearish = any(b["c"] < b["o"] for b in recent)
+    any_bullish = any(b["c"] > b["o"] for b in recent)
+    out = []
+    if hh["rsi"] >= 85 and h4s["bias"] <= -0.3 and dd["bias"] <= -0.3:
+        if upper_wick > body_last * 1.2 or any_bearish or last["c"] < last["o"]:
+            out.append(("SHORT", f"H1 RSI {hh['rsi']:.0f} exhausted · H4/D1 bearish"))
+    if hh["rsi"] <= 15 and h4s["bias"] >= 0.3 and dd["bias"] >= 0.3:
+        if lower_wick > body_last * 1.2 or any_bullish or last["c"] > last["o"]:
+            out.append(("LONG", f"H1 RSI {hh['rsi']:.0f} exhausted · H4/D1 bullish"))
+    return out
+
+
 def load_state():
     st = {"open_signals": [], "history": [],
           "stats": {"total": 0, "wins": 0, "losses": 0,
-                    "expired": 0, "breakeven": 0, "total_pips": 0}}
+                    "expired": 0, "breakeven": 0, "total_pips": 0},
+          "last_heartbeat": None}
     if not os.path.exists(STATE_FILE):
         return st
     try:
@@ -483,6 +470,7 @@ def load_state():
             st["stats"][k] = loaded.get("stats", {}).get(k, 0) or 0
         except Exception:
             st["stats"][k] = 0
+    st["last_heartbeat"] = loaded.get("last_heartbeat")
     return st
 
 
@@ -605,17 +593,16 @@ def filter_cooldown(cands, st):
             w = c[2]["why"].lower()
             if "confluence" in w:
                 s += 30
-            if "overbought" in w or "oversold" in w:
+            if "exhausted" in w:
                 s += 20
             return s
         best = max(out, key=score)
-        print(f"[filter] contradictory ({len(out)} signals) → keeping {best[2]['side']}")
+        print(f"[filter] contradictory ({len(out)}) → keeping {best[2]['side']}")
         return [best]
 
     return out[:1]
 
 
-# ========== FORMAT ==========
 def fmt_signal(s):
     pips = s["risk"] / PIP
     arrow = "🟢 BUY" if s["side"] == "LONG" else "🔴 SELL"
@@ -662,7 +649,6 @@ def fmt_open(st):
     return "\n".join(lines)
 
 
-# ========== TELEGRAM ==========
 def send_tg(text):
     pairs = [("TG_TOKEN", "TG_CHAT"),
              ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"),
@@ -691,33 +677,25 @@ def send_tg(text):
             data={"chat_id": os.environ[ck], "text": text},
             timeout=15)
         print(f"[tg] {tk}/{ck} → {r.status_code}")
-        if r.status_code != 200:
-            print(f"[tg] {r.text[:200]}")
     except Exception as e:
         print(f"[tg] {e}")
 
 
-# ========== MAIN ==========
 def main():
-    print("=== agent.py v6 · closed-candle indicators ===")
+    print("=== agent.py v7 · reversal + heartbeat + D1 fixed ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
     if now.weekday() >= 5:
-        print(f"[skip] {now_pkt} — weekend, market closed")
+        print(f"[skip] {now_pkt} — weekend")
         return
 
-    td = os.environ.get("TWELVEDATA_KEY")
-    tg_ok = any(os.environ.get(tk) and os.environ.get(ck)
-                for tk, ck in [("TG_TOKEN", "TG_CHAT"),
-                               ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"),
-                               ("TELEGRAM_TOKEN", "TELEGRAM_CHAT"),
-                               ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")])
-    print(f"[env] TWELVEDATA_KEY={'✓' if td else '❌'} · TG={'✓' if tg_ok else '❌'}")
+    print(f"[env] TD={'✓' if os.environ.get('TWELVEDATA_KEY') else '❌'} · "
+          f"TG={'✓' if os.environ.get('TELEGRAM_TOKEN') else '❌'}")
 
     h1, h1_src = derive_h1()
     if not h1 or len(h1) < 100:
-        msg = "🚨 GOLD ABORT\nH1 staled on all sources."
+        msg = "🚨 GOLD ABORT\nH1 staled."
         print(msg)
         send_tg(msg)
         return
@@ -729,23 +707,13 @@ def main():
         send_tg(msg)
         return
 
-    if "TwelveData" in h1_src and "GC=F" in d1_src:
-        td_d1 = fetch_twelvedata("1day", 500)
-        if td_d1:
-            td_d1 = closed_only(td_d1, 24.0)
-            if len(td_d1) >= 100:
-                d1r = td_d1
-                d1_src = "TwelveData 1day"
-                print("[d1] switched to TwelveData for source consistency")
-
     h4 = bucketed(h1, 4)
     m15, m15_src = derive_m15()
 
     live_p, live_age, live_src = get_live_quote(prefer_td=True)
     if live_p is None:
         live_p = h1[-1]["c"]
-        live_src = f"{h1_src}(close)"
-        print("[live] fallback to H1 close")
+        live_src = f"{h1_src}(last)"
     print(f"[live] {live_p:.2f} from {live_src}")
 
     gap = abs(live_p - h1[-1]["c"])
@@ -758,7 +726,7 @@ def main():
         print(msg)
         send_tg(msg)
         return
-    print(f"[data] CLEAN · gap=${gap:.2f} (closed H1 vs live)")
+    print(f"[data] CLEAN · gap=${gap:.2f}")
 
     S = {"m15": state(m15, "M15") if m15 else None,
          "h1": state(h1, "H1"),
@@ -779,11 +747,9 @@ def main():
             tf["price"] = live_p
     spot = live_p
 
-    print(f"[main] H1 close={hh['price'] if False else live_p:.2f} · "
-          f"H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
-    print(f"[main] D1 close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f} · "
-          f"EMA20={dd['e20']:.2f} EMA50={dd['e50']:.2f} EMA200={dd['e200']:.2f}")
-    print(f"bias · M15={m['bias']:+.2f} H1={hh['bias']:+.2f} "
+    print(f"[main] H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
+    print(f"[main] D1(GC=F) close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f}")
+    print(f"bias · M15={(m['bias'] if m else 0):+.2f} H1={hh['bias']:+.2f} "
           f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
 
     st = load_state()
@@ -794,9 +760,18 @@ def main():
     for r in resolved:
         print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
 
-    if hh["rsi"] > 85 or hh["rsi"] < 15:
-        print(f"[skip] H1 RSI {hh['rsi']:.0f} — extreme, no new signals")
+    extreme = hh["rsi"] > 85 or hh["rsi"] < 15
+
+    if extreme:
+        print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME → reversal mode only")
         cands = []
+        if m:
+            for side, why in find_reversal(m, hh, h4s, dd):
+                b = build("scalp", m, side, why)
+                if b:
+                    cands.append(("🔄 REVERSAL", "🔄", b))
+        if not cands:
+            print("[gate] no reversal confirmation — staying out")
     else:
         cands = []
         if m:
@@ -826,7 +801,50 @@ def main():
     save_state(st)
 
     if not found and not resolved:
-        print("quiet — no new signal, no resolution")
+        last_hb = st.get("last_heartbeat")
+        should_send = True
+        if last_hb:
+            try:
+                lt = datetime.datetime.fromisoformat(last_hb)
+                if lt.tzinfo is None:
+                    lt = lt.replace(tzinfo=UTC)
+                if (now - lt).total_seconds() < HEARTBEAT_HOURS * 3600:
+                    should_send = False
+            except Exception:
+                pass
+
+        if should_send:
+            lines = [
+                "⏸ GOLD — No signal",
+                f"⏰ {now_pkt}",
+                f"💰 Spot: {spot:.2f}",
+                "",
+                "📊 Market:",
+                f"  H1 RSI: {hh['rsi']:.0f}",
+                f"  H1 bias: {hh['bias']:+.2f}",
+                f"  H4 bias: {h4s['bias']:+.2f}",
+                f"  D1 bias: {dd['bias']:+.2f}",
+            ]
+            if hh["rsi"] > 85:
+                lines.append("")
+                lines.append("⚠️ H1 extremely overbought")
+                lines.append("   No new BUY until pullback")
+                if h4s["bias"] <= -0.3 and dd["bias"] <= -0.3:
+                    lines.append("   Reversal SHORT setup forming")
+                    lines.append("   Waiting for M15 trigger candle")
+            elif hh["rsi"] < 15:
+                lines.append("")
+                lines.append("⚠️ H1 extremely oversold")
+                lines.append("   No new SELL until bounce")
+            else:
+                lines.append("")
+                lines.append("No clean setup — monitoring")
+            send_tg("\n".join(lines))
+            st["last_heartbeat"] = now.isoformat()
+            save_state(st)
+            print("→ heartbeat sent")
+        else:
+            print("quiet — no signal, heartbeat rate-limited")
         return
 
     parts = []
