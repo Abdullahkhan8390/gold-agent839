@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-agent.py v3 — XAUUSD signals + tracking + multi-source data
-Data sources: Yahoo (periods+range, q1+q2) → TwelveData → abort
+agent.py v4 — XAUUSD signals + tracking + multi-source + timezone fixed
+Spot-first: TwelveData XAU/USD is canonical intraday source.
 """
 import os, json, datetime, requests
 
@@ -59,19 +59,26 @@ def fetch(interval, rng, symbol="GC=F", use_periods=False, server="query1"):
 
 
 def fetch_twelvedata(interval="1h", outputsize=500):
+    """TwelveData XAU/USD. FORCES UTC timezone so timestamps are correct."""
     key = os.environ.get("TWELVEDATA_KEY")
-    if not key: return []
+    if not key:
+        print("[td] ❌ no key")
+        return []
     try:
         r = requests.get("https://api.twelvedata.com/time_series",
-                         params={"symbol":"XAU/USD","interval":interval,
-                                 "outputsize":outputsize,"apikey":key}, timeout=20)
+                         params={"symbol":"XAU/USD", "interval":interval,
+                                 "outputsize":outputsize, "apikey":key,
+                                 "timezone":"UTC",      # ← FIX: force UTC
+                                 "order":"ASC"},        # ← oldest first
+                         timeout=20)
         j = r.json()
     except Exception as e:
         print(f"[td] request: {e}"); return []
     if j.get("status") == "error" or "values" not in j:
-        print(f"[td] error: {j.get('message','no values')}"); return []
+        print(f"[td] ❌ {j.get('message','no values')}")
+        return []
     rows = []
-    for v in reversed(j["values"]):
+    for v in j["values"]:                            # ASC → no reverse needed
         try:
             ds = v["datetime"]
             fmt = "%Y-%m-%d %H:%M:%S" if " " in ds else "%Y-%m-%d"
@@ -81,6 +88,7 @@ def fetch_twelvedata(interval="1h", outputsize=500):
                          "l": float(v["low"]), "c": float(v["close"])})
         except Exception:
             continue
+    print(f"[td] ✓ {len(rows)} bars · last={rows[-1]['c']:.2f} @ {j['values'][-1]['datetime']}")
     return rows
 
 
@@ -98,18 +106,20 @@ def fetch_fresh(interval, rng, max_age_h):
         if not rows: continue
         age = (datetime.datetime.now(UTC).timestamp() - rows[-1]["t"]) / 3600.0
         tag = f"{sym} {interval} {server}{'/p' if periods else '/r'}"
-        if age <= max_age_h:
+        # FIX: reject future-dated bars too
+        if -0.5 <= age <= max_age_h:
             print(f"[data] OK {tag} · {age:.1f}h · {len(rows)} bars")
             return rows, tag
-        if best is None or age < best[1]:
+        if best is None or abs(age) < abs(best[1]):
             best = (tag, age)
+    # Yahoo failed → try TwelveData
     td_map = {"1h":"1h","60m":"1h","15m":"15min","5m":"5min","1m":"1min","1d":"1day"}
     tid = td_map.get(interval)
     if tid:
         rows = fetch_twelvedata(tid)
         if rows:
             age = (datetime.datetime.now(UTC).timestamp() - rows[-1]["t"]) / 3600.0
-            if age <= max_age_h:
+            if -0.5 <= age <= max_age_h:
                 print(f"[data] OK TwelveData {tid} · {age:.1f}h · {len(rows)} bars")
                 return rows, f"TwelveData {tid}"
             print(f"[data] TwelveData {tid} STALE {age:.1f}h")
@@ -146,7 +156,20 @@ def derive_m15():
     return [], None
 
 
-def get_live_quote():
+def get_live_quote(prefer_td=True):
+    """Prefer TwelveData spot XAU/USD — matches H1 source, matches chart."""
+    if prefer_td and os.environ.get("TWELVEDATA_KEY"):
+        try:
+            r = requests.get("https://api.twelvedata.com/price",
+                             params={"symbol":"XAU/USD",
+                                     "apikey":os.environ["TWELVEDATA_KEY"]},
+                             timeout=15)
+            p = float(r.json().get("price", 0))
+            if p > 0:
+                return p, 0.5, "TwelveData"
+        except Exception as e:
+            print(f"[live] TD: {e}")
+    # Fallbacks
     for name, url in [
         ("XAUUSD=X", "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"),
         ("GC=F",     "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"),
@@ -160,20 +183,10 @@ def get_live_quote():
             p = meta.get("regularMarketPrice")
             t = meta.get("regularMarketTime")
             if p:
-                age_min = (datetime.datetime.now(UTC).timestamp() - t) / 60.0 if t else 9999
+                age_min = (datetime.datetime.now(UTC).timestamp() - t)/60.0 if t else 9999
                 return float(p), age_min, name
         except Exception:
             continue
-    if os.environ.get("TWELVEDATA_KEY"):
-        try:
-            r = requests.get("https://api.twelvedata.com/price",
-                             params={"symbol":"XAU/USD","apikey":os.environ["TWELVEDATA_KEY"]},
-                             timeout=15)
-            p = float(r.json().get("price", 0))
-            if p > 0:
-                return p, 0.5, "TwelveData"
-        except Exception:
-            pass
     return None, None, None
 
 
@@ -241,7 +254,6 @@ def state(rows, label):
             "_bars": rows}
 
 
-# ══════════ BUILD ══════════
 def build(kind, tf, side, why):
     cfg = CFG[kind]; p = tf["price"]; a = tf["atr"]; mx = cfg["max_sl"]
     if side == "LONG":
@@ -513,15 +525,19 @@ def send_tg(text):
 
 # ══════════ MAIN ══════════
 def main():
-    print("=== agent.py v3 · multi-source data ===")
+    print("=== agent.py v4 · timezone fixed + spot-first ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
     if now.weekday() >= 5:
         print(f"[skip] {now_pkt} — weekend"); return
 
+    td = os.environ.get("TWELVEDATA_KEY")
+    print(f"[env] TWELVEDATA_KEY={'✓' if td else '❌'} · "
+          f"TG_TOKEN={'✓' if os.environ.get('TG_TOKEN') else '❌'}")
+
     h1, h1_src = derive_h1()
     if not h1 or len(h1) < 100:
-        msg = "🚨 GOLD ABORT\nH1 staled on all sources.\nAdd TWELVEDATA_KEY secret."
+        msg = "🚨 GOLD ABORT\nH1 staled on all sources."
         print(msg); send_tg(msg); return
 
     d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H)
@@ -529,20 +545,32 @@ def main():
         msg = "🚨 GOLD ABORT\nD1 staled."
         print(msg); send_tg(msg); return
 
-    print(f"[main] H1={h1_src} · {len(h1)} bars")
+    print(f"[main] H1={h1_src} · {len(h1)} bars · close={h1[-1]['c']:.2f}")
     print(f"[main] D1={d1_src} · close={d1r[-1]['c']:.2f}")
 
     h4 = bucketed(h1, 4)
     m15, m15_src = derive_m15()
 
-    live_p, live_age, live_src = get_live_quote()
+    # Live price: prefer TD spot XAU/USD to match H1 source
+    live_p, live_age, live_src = get_live_quote(prefer_td=True)
     if live_p is None:
         live_p = h1[-1]["c"]; live_src = f"{h1_src}(close)"
         print(f"[live] fallback to H1 close")
     print(f"[live] {live_p:.2f} from {live_src}")
 
-    gap = abs(live_p - h1[-1]["c"])
-    limit = max(live_p * 0.003, 3.0)
+    # Gap check: only compare if live is non-TD (cross-instrument risk)
+    # If both H1 and live are TwelveData spot → gap should be tiny
+    if live_src == "TwelveData" and "TwelveData" in h1_src:
+        # Same source — tight tolerance
+        gap = abs(live_p - h1[-1]["c"])
+        limit = max(live_p * 0.001, 1.0)     # 0.1% or $1
+        print(f"[data] same-source (spot-spot) · gap=${gap:.2f} limit=${limit:.2f}")
+    else:
+        # Mixed spot vs futures — wider tolerance
+        gap = abs(live_p - h1[-1]["c"])
+        limit = max(live_p * 0.008, 25.0)    # 0.8% or $25
+        print(f"[data] mixed-source (spot/fut) · gap=${gap:.2f} limit=${limit:.2f}")
+
     if gap > limit:
         msg = (f"⚠️ GOLD ABORT — PRICE MISMATCH\n"
                f"Live:  {live_p:.2f} ({live_src})\n"
