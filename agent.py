@@ -352,15 +352,57 @@ def fmt_signal(sig):
 
 
 def send_tg(text):
-    token = os.environ.get("TG_TOKEN")
-    chat = os.environ.get("TG_CHAT")
-    if not token or not chat:
-        print("[tg] no TG_TOKEN/TG_CHAT — skipping"); return
+    """Try multiple env var names + save to file if Telegram fails."""
+    pairs = [
+        ("TG_TOKEN", "TG_CHAT"),
+        ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"),
+        ("TELEGRAM_TOKEN", "TELEGRAM_CHAT"),
+        ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"),
+        ("TELEGRAM_BOT_TOKEN", "CHAT_ID"),
+        ("BOT_TOKEN", "CHAT_ID"),
+    ]
+    token = chat = used = None
+    for tk, ck in pairs:
+        t, c = os.environ.get(tk), os.environ.get(ck)
+        if t and c:
+            token, chat, used = t, c, f"{tk}/{ck}"
+            break
+
+    # ALWAYS save to file (backup, never lose a signal)
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat, "text": text}, timeout=15)
+        os.makedirs("signals", exist_ok=True)
+        fname = f"signals/{datetime.datetime.now(UTC).strftime('%Y%m%d')}.log"
+        with open(fname, "a") as f:
+            f.write(f"\n\n=== {datetime.datetime.now(UTC).isoformat()} ===\n{text}\n")
+        print(f"[file] saved → {fname}")
     except Exception as e:
-        print("[tg] error:", e)
+        print(f"[file] save failed: {e}")
+
+    if not token or not chat:
+        print("[tg] ⚠️  NO TELEGRAM ENV VARS FOUND")
+        print("[tg] Available suspicious env vars:")
+        found_any = False
+        for k in sorted(os.environ):
+            if any(k.startswith(p) for p in ("TG", "TELEGRAM", "BOT", "CHAT")):
+                val = os.environ[k]
+                preview = (val[:6] + "..." + val[-4:]) if len(val) > 12 else "***"
+                print(f"    {k} = {preview}")
+                found_any = True
+        if not found_any:
+            print("    (none — workflow is NOT passing env vars to agent.py)")
+        print("[tg] → check GitHub Secrets + workflow env mapping")
+        return
+
+    print(f"[tg] using {used}")
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat, "text": text}, timeout=15)
+        print(f"[tg] status={r.status_code}")
+        if r.status_code != 200:
+            print(f"[tg] ❌ body={r.text[:300]}")
+    except Exception as e:
+        print("[tg] ❌ error:", e)
+
 
 
 def main():
@@ -424,7 +466,7 @@ def main():
 
     # ─── Print ───
     for name, emoji, sig in found:
-        print(f"\n{emoji} {name} — {fmt_signal(sig)}")
+        print(f"\n{name} — {fmt_signal(sig)}")
 
     # ─── Save state ───
     now_iso = datetime.datetime.now(UTC).isoformat()
