@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent.py v8 — D1 sanity check + no fake reversals
+agent.py v9 — D1 derived from H1 (no external D1 dependency, no more failures)
 """
 import os, json, datetime, requests
 
@@ -14,9 +14,7 @@ MAX_SL_PIPS = 100
 STATE_FILE = "signal_state.json"
 MAX_AGE_M15_H = 1.0
 MAX_AGE_H1_H  = 3.0
-MAX_AGE_D1_H  = 72.0
 HEARTBEAT_HOURS = 4
-D1_MAX_DEV_PCT = 3.0   # reject D1 if close deviates >3% from live spot
 
 CFG = {
     "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m-4h"},
@@ -74,11 +72,13 @@ def fetch_twelvedata(interval="1h", outputsize=500):
             params={"symbol": "XAU/USD", "interval": interval,
                     "outputsize": outputsize, "apikey": key,
                     "timezone": "UTC", "order": "ASC"},
-            timeout=20)
+            timeout=30)
         j = r.json()
-    except Exception:
+    except Exception as e:
+        print(f"[td] request: {e}")
         return []
     if j.get("status") == "error" or "values" not in j:
+        print(f"[td] error: {j.get('message','no values')}")
         return []
     rows = []
     for v in j["values"]:
@@ -103,70 +103,72 @@ def closed_only(rows, tf_hours):
     return rows
 
 
-def fetch_fresh(interval, rng, max_age_h, tf_hours):
+def fetch_h1_yahoo():
     attempts = [
         ("GC=F",     True,  "query1"),
         ("GC=F",     False, "query1"),
         ("GC=F",     True,  "query2"),
         ("XAUUSD=X", True,  "query1"),
-        ("XAUUSD=X", False, "query1"),
     ]
     best = None
     for sym, periods, server in attempts:
-        rows = fetch(interval, rng, sym, use_periods=periods, server=server)
+        rows = fetch("1h", "60d", sym, use_periods=periods, server=server)
         if not rows:
             continue
         age = (datetime.datetime.now(UTC).timestamp() - rows[-1]["t"]) / 3600.0
-        tag = f"{sym} {interval} {server}{'/p' if periods else '/r'}"
-        if -0.5 <= age <= max_age_h:
-            print(f"[data] OK {tag} · {age:.1f}h · {len(rows)} bars")
-            return closed_only(rows, tf_hours), tag
+        tag = f"{sym} 1h {server}{'/p' if periods else '/r'}"
+        if -0.5 <= age <= MAX_AGE_H1_H:
+            return closed_only(rows, 1.0), tag
         if best is None or abs(age) < abs(best[1]):
             best = (tag, age)
-    td_map = {"1h":"1h","60m":"1h","15m":"15min","5m":"5min","1m":"1min","1d":"1day"}
-    tid = td_map.get(interval)
-    if tid:
-        rows = fetch_twelvedata(tid)
-        if rows:
-            age = (datetime.datetime.now(UTC).timestamp() - rows[-1]["t"]) / 3600.0
-            if -0.5 <= age <= max_age_h:
-                rows = closed_only(rows, tf_hours)
-                print(f"[data] OK TwelveData {tid} · {age:.1f}h · {len(rows)} closed bars")
-                return rows, f"TwelveData {tid}"
-            print(f"[data] TwelveData {tid} STALE {age:.1f}h")
     return [], None
 
 
-def derive_h1():
-    h1, src = fetch_fresh("1h", "60d", MAX_AGE_H1_H, 1.0)
-    if h1 and len(h1) >= 100:
-        return h1, src
-    for small, rng, th in (("15m","30d",0.25), ("5m","10d",0.083), ("1m","5d",0.017)):
-        rows, src2 = fetch_fresh(small, rng, 1.0, th)
-        if rows:
-            h1 = bucketed(rows, 1)
-            if len(h1) >= 100:
-                print(f"[data] H1 from {src2} → {len(h1)} bars")
-                return h1, f"{src2}→H1"
-    return [], None
+def derive_core_tfs():
+    """Fetch large H1 dataset ONCE. Derive H1, H4, D1 from same source."""
+    # Try TwelveData with big outputsize first (best history)
+    raw = fetch_twelvedata("1h", 5000)
+    if raw and len(raw) >= 4000:
+        raw = closed_only(raw, 1.0)
+        h1 = raw[-500:]              # last 500 for H1 view
+        h4 = bucketed(raw, 4)         # all data bucketed to 4h
+        d1 = bucketed(raw, 24)        # all data bucketed to 1d
+        print(f"[core] TD 1h · {len(raw)} bars → H1={len(h1)} H4={len(h4)} D1={len(d1)}")
+        return h1, h4, d1, "TwelveData 1h (derived H4/D1)"
+    # Fallback: Yahoo H1
+    raw, src = fetch_h1_yahoo()
+    if raw and len(raw) >= 400:
+        h1 = raw[-500:] if len(raw) > 500 else raw
+        h4 = bucketed(raw, 4)
+        d1 = bucketed(raw, 24)
+        print(f"[core] {src} · {len(raw)} bars → H1={len(h1)} H4={len(h4)} D1={len(d1)}")
+        if len(d1) < 100:
+            print(f"[core] ⚠️ D1 history short ({len(d1)} bars) — EMA200 will be clamped")
+        return h1, h4, d1, src
+    return [], [], [], None
 
 
 def derive_m15():
-    m15, src = fetch_fresh("15m", "30d", MAX_AGE_M15_H, 0.25)
-    if m15 and len(m15) >= 60:
-        return m15, src
-    for small, rng, th in (("5m","10d",0.083), ("1m","5d",0.017)):
-        rows, src2 = fetch_fresh(small, rng, 1.0, th)
-        if rows:
-            m15 = bucketed(rows, 0.25)
-            if len(m15) >= 60:
-                print(f"[data] M15 from {src2} → {len(m15)} bars")
-                return m15, f"{src2}→M15"
+    # TwelveData 15min
+    raw = fetch_twelvedata("15min", 500)
+    if raw and len(raw) >= 60:
+        raw = closed_only(raw, 0.25)
+        print(f"[m15] TD 15min · {len(raw)} closed bars")
+        return raw, "TwelveData 15min"
+    # Fallback: Yahoo 15m
+    for sym, use_p, server in [("GC=F", True, "query1"), ("XAUUSD=X", True, "query1")]:
+        raw = fetch("15m", "30d", sym, use_periods=use_p, server=server)
+        if raw and len(raw) >= 60:
+            age = (datetime.datetime.now(UTC).timestamp() - raw[-1]["t"]) / 3600.0
+            if age <= MAX_AGE_M15_H:
+                raw = closed_only(raw, 0.25)
+                print(f"[m15] {sym} 15m · {len(raw)} bars")
+                return raw, f"{sym} 15m"
     return [], None
 
 
-def get_live_quote(prefer_td=True):
-    if prefer_td and os.environ.get("TWELVEDATA_KEY"):
+def get_live_quote():
+    if os.environ.get("TWELVEDATA_KEY"):
         try:
             r = requests.get(
                 "https://api.twelvedata.com/price",
@@ -175,28 +177,22 @@ def get_live_quote(prefer_td=True):
                 timeout=15)
             p = float(r.json().get("price", 0))
             if p > 0:
-                return p, 0.5, "TwelveData"
-        except Exception as e:
-            print(f"[live] TD: {e}")
+                return p, "TwelveData"
+        except Exception:
+            pass
     for name, url in [
         ("XAUUSD=X", "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"),
         ("GC=F",     "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"),
     ]:
         try:
             r = requests.get(url, headers=UA, timeout=15)
-            j = r.json()
-            res = (j.get("chart") or {}).get("result")
-            if not res:
-                continue
-            meta = res[0].get("meta") or {}
-            p = meta.get("regularMarketPrice")
-            t = meta.get("regularMarketTime")
+            res = ((r.json().get("chart") or {}).get("result") or [{}])[0]
+            p = (res.get("meta") or {}).get("regularMarketPrice")
             if p:
-                age_min = (datetime.datetime.now(UTC).timestamp() - t) / 60.0 if t else 9999
-                return float(p), age_min, name
+                return float(p), name
         except Exception:
             continue
-    return None, None, None
+    return None, None
 
 
 def bucketed(rows, hours):
@@ -230,14 +226,11 @@ def rsi_last(vals, n=14):
     if len(vals) < n + 1:
         return 50.0
     seg = vals[-(n + 1):]
-    g = 0.0
-    l = 0.0
+    g = 0.0; l = 0.0
     for i in range(1, len(seg)):
         d = seg[i] - seg[i - 1]
-        if d > 0:
-            g += d
-        else:
-            l += -d
+        if d > 0: g += d
+        else: l += -d
     if l == 0:
         return 100.0
     return 100 - 100 / (1 + g / l)
@@ -258,16 +251,14 @@ def state(rows, label):
     if len(rows) < 60:
         return None
     closes = [r["c"] for r in rows]
-    highs = [r["h"] for r in rows]
-    lows = [r["l"] for r in rows]
+    highs  = [r["h"] for r in rows]
+    lows   = [r["l"] for r in rows]
     p = closes[-1]
     e20 = ema(closes, 20)[-1]
     e50 = ema(closes, 50)[-1]
     e200 = ema(closes, 200)[-1]
     rv = rsi_last(closes)
-    a = atr_last(highs, lows, closes)
-    if a <= 0:
-        a = max(p * 0.0005, 0.01)
+    a = atr_last(highs, lows, closes) or max(p * 0.0005, 0.01)
     score = 0
     score += 1 if p > e200 else -1
     score += 1 if e20 > e50 else -1
@@ -281,60 +272,42 @@ def state(rows, label):
 
 
 def build(kind, tf, side, why):
-    cfg = CFG[kind]
-    p = tf["price"]
-    a = tf["atr"]
-    mx = cfg["max_sl"]
+    cfg = CFG[kind]; p = tf["price"]; a = tf["atr"]; mx = cfg["max_sl"]
     if side == "LONG":
         sl_a = p - cfg["sl"] * a
         sl_s = tf["lo_prev"] - 0.10 * a
         sl = max(sl_a, sl_s) if sl_s < p else sl_a
-        if p - sl < 0.20 * a:
-            sl = p - 0.20 * a
-        if p - sl > mx:
-            sl = p - mx
+        if p - sl < 0.20 * a: sl = p - 0.20 * a
+        if p - sl > mx: sl = p - mx
         risk = p - sl
-        if risk <= 0.05:
-            return None
+        if risk <= 0.05: return None
         if risk / PIP > MAX_SL_PIPS:
-            print(f"[build] rejected {side} {kind}: SL {risk/PIP:.0f}p > {MAX_SL_PIPS}p")
+            print(f"[build] rejected {side} {kind}: {risk/PIP:.0f}p")
             return None
-        tp1 = p + risk
-        tp2 = p + risk * 2
+        tp1 = p + risk; tp2 = p + risk * 2
     else:
         sl_a = p + cfg["sl"] * a
         sl_s = tf["hi_prev"] + 0.10 * a
         sl = min(sl_a, sl_s) if sl_s > p else sl_a
-        if sl - p < 0.20 * a:
-            sl = p + 0.20 * a
-        if sl - p > mx:
-            sl = p + mx
+        if sl - p < 0.20 * a: sl = p + 0.20 * a
+        if sl - p > mx: sl = p + mx
         risk = sl - p
-        if risk <= 0.05:
-            return None
+        if risk <= 0.05: return None
         if risk / PIP > MAX_SL_PIPS:
-            print(f"[build] rejected {side} {kind}: SL {risk/PIP:.0f}p > {MAX_SL_PIPS}p")
+            print(f"[build] rejected {side} {kind}: {risk/PIP:.0f}p")
             return None
-        tp1 = p - risk
-        tp2 = p - risk * 2
+        tp1 = p - risk; tp2 = p - risk * 2
     return {"kind": kind, "side": side, "entry": p, "sl": sl,
             "tp1": tp1, "tp2": tp2, "risk": risk,
             "why": why, "hold": cfg["hold"], "tf": tf["label"]}
 
 
 def find_scalp(m, hh, h4s):
-    if not m or len(m["_bars"]) < 25:
-        return []
-    a = m["atr"]
-    p = m["price"]
-    rsi = m["rsi"]
-    bars = m["_bars"]
-    last = bars[-1]
-    prev = bars[-2]
+    if not m or len(m["_bars"]) < 25: return []
+    a = m["atr"]; p = m["price"]; rsi = m["rsi"]
+    bars = m["_bars"]; last = bars[-1]; prev = bars[-2]
     out = []
-    lb = last["c"] > last["o"]
-    lbe = last["c"] < last["o"]
-    pb = prev["c"] > prev["o"]
+    lb = last["c"] > last["o"]; lbe = last["c"] < last["o"]; pb = prev["c"] > prev["o"]
     body = abs(last["c"] - last["o"])
     near = abs(p - m["e20"]) <= 1.0 * a
     if hh["bias"] >= 0:
@@ -348,6 +321,8 @@ def find_scalp(m, hh, h4s):
             out.append(("LONG", "M15 2-bar bull"))
         if rsi < 32:
             out.append(("LONG", f"M15 oversold (RSI {rsi:.0f})"))
+        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3 and lb:
+            out.append(("LONG", "H1+H4 bull confluence"))
     if hh["bias"] <= 0:
         if lbe and body > 0.35 * a and rsi > 22:
             out.append(("SHORT", f"M15 momentum (RSI {rsi:.0f})"))
@@ -359,22 +334,17 @@ def find_scalp(m, hh, h4s):
             out.append(("SHORT", "M15 2-bar bear"))
         if rsi > 68:
             out.append(("SHORT", f"M15 overbought (RSI {rsi:.0f})"))
+        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3 and lbe:
+            out.append(("SHORT", "H1+H4 bear confluence"))
     return out
 
 
 def find_intraday(hh, h4s):
-    if not hh or len(hh["_bars"]) < 21:
-        return []
-    a = hh["atr"]
-    p = hh["price"]
-    rsi = hh["rsi"]
-    bars = hh["_bars"]
-    last = bars[-1]
-    prev = bars[-2]
+    if not hh or len(hh["_bars"]) < 21: return []
+    a = hh["atr"]; p = hh["price"]; rsi = hh["rsi"]
+    bars = hh["_bars"]; last = bars[-1]; prev = bars[-2]
     out = []
-    lb = last["c"] > last["o"]
-    lbe = last["c"] < last["o"]
-    pb = prev["c"] > prev["o"]
+    lb = last["c"] > last["o"]; lbe = last["c"] < last["o"]; pb = prev["c"] > prev["o"]
     body = abs(last["c"] - last["o"])
     near = abs(p - hh["e20"]) <= 1.0 * a
     if hh["bias"] >= 0 or h4s["bias"] >= 0:
@@ -388,6 +358,8 @@ def find_intraday(hh, h4s):
             out.append(("LONG", "H1 2-bar bull"))
         if rsi < 32:
             out.append(("LONG", f"H1 oversold (RSI {rsi:.0f})"))
+        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3:
+            out.append(("LONG", "H1+H4 bull confluence"))
     if hh["bias"] <= 0 or h4s["bias"] <= 0:
         if lbe and body > 0.35 * a and rsi > 24:
             out.append(("SHORT", f"H1 momentum (RSI {rsi:.0f})"))
@@ -399,27 +371,25 @@ def find_intraday(hh, h4s):
             out.append(("SHORT", "H1 2-bar bear"))
         if rsi > 68:
             out.append(("SHORT", f"H1 overbought (RSI {rsi:.0f})"))
+        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3:
+            out.append(("SHORT", "H1+H4 bear confluence"))
     return out
 
 
 def find_reversal(m, hh, h4s, dd):
-    """Extreme H1 RSI + H4 + D1 confluence + M15 trigger candle."""
-    if not m or len(m["_bars"]) < 5:
-        return []
-    bars = m["_bars"]
-    last = bars[-1]
-    recent = bars[-3:]
-    body_last = abs(last["c"] - last["o"]) or 0.01
-    upper_wick = last["h"] - max(last["c"], last["o"])
-    lower_wick = min(last["c"], last["o"]) - last["l"]
-    any_bearish = any(b["c"] < b["o"] for b in recent)
-    any_bullish = any(b["c"] > b["o"] for b in recent)
+    if not m or len(m["_bars"]) < 5: return []
+    bars = m["_bars"]; last = bars[-1]; recent = bars[-3:]
+    body = abs(last["c"] - last["o"]) or 0.01
+    upper = last["h"] - max(last["c"], last["o"])
+    lower = min(last["c"], last["o"]) - last["l"]
+    any_bear = any(b["c"] < b["o"] for b in recent)
+    any_bull = any(b["c"] > b["o"] for b in recent)
     out = []
     if hh["rsi"] >= 85 and h4s["bias"] <= -0.3 and dd["bias"] <= -0.3:
-        if upper_wick > body_last * 1.2 or any_bearish or last["c"] < last["o"]:
+        if upper > body * 1.2 or any_bear or last["c"] < last["o"]:
             out.append(("SHORT", f"H1 RSI {hh['rsi']:.0f} exhausted · H4/D1 bearish"))
     if hh["rsi"] <= 15 and h4s["bias"] >= 0.3 and dd["bias"] >= 0.3:
-        if lower_wick > body_last * 1.2 or any_bullish or last["c"] > last["o"]:
+        if lower > body * 1.2 or any_bull or last["c"] > last["o"]:
             out.append(("LONG", f"H1 RSI {hh['rsi']:.0f} exhausted · H4/D1 bullish"))
     return out
 
@@ -429,68 +399,47 @@ def load_state():
           "stats": {"total": 0, "wins": 0, "losses": 0,
                     "expired": 0, "breakeven": 0, "total_pips": 0},
           "last_heartbeat": None}
-    if not os.path.exists(STATE_FILE):
-        return st
-    try:
-        loaded = json.load(open(STATE_FILE))
-    except Exception:
-        return st
+    if not os.path.exists(STATE_FILE): return st
+    try: loaded = json.load(open(STATE_FILE))
+    except Exception: return st
     st["open_signals"] = [s for s in loaded.get("open_signals", [])
                           if not str(s.get("id", "")).startswith("TEST-")]
     st["history"] = [s for s in loaded.get("history", [])
                      if not str(s.get("id", "")).startswith("TEST-")]
     for k in st["stats"]:
-        try:
-            st["stats"][k] = loaded.get("stats", {}).get(k, 0) or 0
-        except Exception:
-            st["stats"][k] = 0
+        try: st["stats"][k] = loaded.get("stats", {}).get(k, 0) or 0
+        except Exception: st["stats"][k] = 0
     st["last_heartbeat"] = loaded.get("last_heartbeat")
     return st
 
 
 def save_state(st):
-    try:
-        json.dump(st, open(STATE_FILE, "w"), indent=2, default=str)
-    except Exception as e:
-        print(f"[state] save failed: {e}")
+    try: json.dump(st, open(STATE_FILE, "w"), indent=2, default=str)
+    except Exception as e: print(f"[state] save failed: {e}")
 
 
 def check_open_signals(st, price, now):
-    resolved = []
-    still = []
+    resolved = []; still = []
     for sig in st["open_signals"]:
         try:
             cr = datetime.datetime.fromisoformat(sig["created_at"])
-            if cr.tzinfo is None:
-                cr = cr.replace(tzinfo=UTC)
-        except Exception:
-            continue
+            if cr.tzinfo is None: cr = cr.replace(tzinfo=UTC)
+        except Exception: continue
         age = (now - cr).total_seconds() / 3600.0
         if age > sig.get("max_hours", MAX_HOURS_OPEN):
             sig.update({"result": "EXPIRED", "exit_price": price, "pips": 0.0,
                         "closed_at": now.isoformat(), "age_hours": round(age, 1)})
-            resolved.append(sig)
-            continue
-        side = sig["side"]
-        sl = sig["sl"]
-        tp1 = sig["tp1"]
-        tp2 = sig["tp2"]
-        risk = sig["risk"]
-        hit = None
+            resolved.append(sig); continue
+        side = sig["side"]; sl = sig["sl"]; tp1 = sig["tp1"]; tp2 = sig["tp2"]
+        risk = sig["risk"]; hit = None
         if side == "LONG":
-            if price <= sl:
-                hit = "SL"
-            elif price >= tp2:
-                hit = "TP2"
-            elif price >= tp1:
-                hit = "TP1"
+            if price <= sl: hit = "SL"
+            elif price >= tp2: hit = "TP2"
+            elif price >= tp1: hit = "TP1"
         else:
-            if price >= sl:
-                hit = "SL"
-            elif price <= tp2:
-                hit = "TP2"
-            elif price <= tp1:
-                hit = "TP1"
+            if price >= sl: hit = "SL"
+            elif price <= tp2: hit = "TP2"
+            elif price <= tp1: hit = "TP1"
         if hit == "SL":
             if sig.get("tp1_hit"):
                 sig.update({"result": "BREAKEVEN", "pips": round(0.5 * risk / PIP, 1)})
@@ -527,51 +476,38 @@ def check_open_signals(st, price, now):
 
 def filter_cooldown(cands, st):
     now = datetime.datetime.now(UTC)
-    out = []
-    seen = set()
+    out = []; seen = set()
     for name, emoji, sig in cands:
         k = (sig["side"], round(sig["entry"], 1))
-        if k in seen:
-            continue
+        if k in seen: continue
         blocked = False
         for s in st["open_signals"]:
-            if s["side"] != sig["side"]:
-                continue
+            if s["side"] != sig["side"]: continue
             try:
                 t = datetime.datetime.fromisoformat(s["created_at"])
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=UTC)
+                if t.tzinfo is None: t = t.replace(tzinfo=UTC)
                 if (now - t).total_seconds() / 3600 < COOLDOWN_HOURS:
-                    blocked = True
-                    break
-            except Exception:
-                pass
-        if blocked:
-            continue
-        seen.add(k)
-        out.append((name, emoji, sig))
-
+                    blocked = True; break
+            except Exception: pass
+        if blocked: continue
+        seen.add(k); out.append((name, emoji, sig))
     before = len(out)
     out = [c for c in out if c[2]["risk"] / PIP <= MAX_SL_PIPS]
     if len(out) < before:
         print(f"[filter] rejected {before - len(out)} over-cap SL")
-
-    if not out:
-        return []
-
+    if not out: return []
     sides = set(c[2]["side"] for c in out)
     if len(sides) > 1:
         def score(c):
             pips = c[2]["risk"] / PIP
             s = 200 - pips
             w = c[2]["why"].lower()
-            if "exhausted" in w:
-                s += 30
+            if "exhausted" in w: s += 30
+            if "confluence" in w: s += 20
             return s
         best = max(out, key=score)
-        print(f"[filter] contradictory → keeping {best[2]['side']}")
+        print(f"[filter] contradictory ({len(out)}) → keeping {best[2]['side']}")
         return [best]
-
     return out[:1]
 
 
@@ -588,12 +524,10 @@ def fmt_signal(s):
 
 
 def fmt_prev(res):
-    if not res:
-        return ""
+    if not res: return ""
     lines = ["📈 LAST RESULT(S)"]
     for s in res:
-        ic = {"WIN": "🟢", "LOSS": "🔴",
-              "BREAKEVEN": "🟡", "EXPIRED": "⚪"}.get(s["result"], "⚪")
+        ic = {"WIN":"🟢","LOSS":"🔴","BREAKEVEN":"🟡","EXPIRED":"⚪"}.get(s["result"],"⚪")
         arr = "BUY" if s["side"] == "LONG" else "SELL"
         lines.append(f"  {ic} {s['result']} · {arr} {s['entry']:.2f} → "
                      f"{s['exit_price']:.2f} ({s['pips']:+.0f}p) · {s['age_hours']}h")
@@ -602,8 +536,7 @@ def fmt_prev(res):
 
 def fmt_stats(st):
     s = st["stats"]
-    if s["total"] == 0:
-        return ""
+    if s["total"] == 0: return ""
     dec = s["wins"] + s["losses"]
     wr = (s["wins"] / dec * 100) if dec > 0 else 0
     return (f"📊 STATS ({s['total']})\n"
@@ -612,8 +545,7 @@ def fmt_stats(st):
 
 
 def fmt_open(st):
-    if not st["open_signals"]:
-        return ""
+    if not st["open_signals"]: return ""
     lines = [f"🔓 OPEN ({len(st['open_signals'])})"]
     for s in st["open_signals"]:
         arr = "BUY" if s["side"] == "LONG" else "SELL"
@@ -631,17 +563,14 @@ def send_tg(text):
     tk = ck = None
     for a, b in pairs:
         if os.environ.get(a) and os.environ.get(b):
-            tk, ck = a, b
-            break
+            tk, ck = a, b; break
     try:
         os.makedirs("signals", exist_ok=True)
         fn = f"signals/{datetime.datetime.now(UTC).strftime('%Y%m%d')}.log"
         with open(fn, "a") as f:
             f.write(f"\n\n=== {datetime.datetime.now(UTC).isoformat()} ===\n{text}\n")
-    except Exception:
-        pass
-    if not tk:
-        return
+    except Exception: pass
+    if not tk: return
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{os.environ[tk]}/sendMessage",
@@ -653,7 +582,7 @@ def send_tg(text):
 
 
 def main():
-    print("=== agent.py v8 · D1 sanity check activated ===")
+    print("=== agent.py v9 · D1 derived from H1 ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
@@ -664,16 +593,20 @@ def main():
     print(f"[env] TD={'✓' if os.environ.get('TWELVEDATA_KEY') else '❌'} · "
           f"TG={'✓' if os.environ.get('TELEGRAM_TOKEN') else '❌'}")
 
-    h1, h1_src = derive_h1()
+    h1, h4, d1r, core_src = derive_core_tfs()
     if not h1 or len(h1) < 100:
-        print("🚨 ABORT — H1 staled")
-        send_tg("🚨 GOLD ABORT\nH1 staled.")
-        return
+        msg = "🚨 GOLD ABORT\nH1 unavailable."
+        print(msg); send_tg(msg); return
+    if not h4 or len(h4) < 30:
+        msg = "🚨 GOLD ABORT\nH4 unavailable."
+        print(msg); send_tg(msg); return
+    if not d1r or len(d1r) < 10:
+        msg = "🚨 GOLD ABORT\nD1 unavailable."
+        print(msg); send_tg(msg); return
 
-    live_p, live_age, live_src = get_live_quote(prefer_td=True)
+    live_p, live_src = get_live_quote()
     if live_p is None:
-        live_p = h1[-1]["c"]
-        live_src = f"{h1_src}(last)"
+        live_p = h1[-1]["c"]; live_src = f"{core_src}(close)"
     print(f"[live] {live_p:.2f} from {live_src}")
 
     gap = abs(live_p - h1[-1]["c"])
@@ -681,69 +614,34 @@ def main():
     if gap > limit:
         msg = (f"⚠️ GOLD ABORT — PRICE MISMATCH\n"
                f"Live: {live_p:.2f} ({live_src})\n"
-               f"H1:   {h1[-1]['c']:.2f} ({h1_src})\n"
+               f"H1:   {h1[-1]['c']:.2f}\n"
                f"Gap:  ${gap:.2f} > ${limit:.2f}")
-        print(msg)
-        send_tg(msg)
-        return
+        print(msg); send_tg(msg); return
     print(f"[data] CLEAN · gap=${gap:.2f}")
 
-    # D1 fetch + sanity check
-    d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H, 24.0)
-    d1_ok = False
-    if d1r and len(d1r) >= 100:
-        d1_close = d1r[-1]["c"]
-        d1_dev = abs(d1_close - live_p) / live_p * 100
-        print(f"[d1] {d1_src} close={d1_close:.2f} dev={d1_dev:.1f}%")
-        if d1_dev <= D1_MAX_DEV_PCT:
-            d1_ok = True
-            print(f"[d1] OK — within {D1_MAX_DEV_PCT}% of spot")
-        else:
-            print(f"[d1] ⚠️ REJECTED — {d1_dev:.1f}% dev > {D1_MAX_DEV_PCT}%")
-            print(f"[d1] data corrupted upstream, using H4 as top bias proxy")
-    else:
-        print(f"[d1] fetch failed")
-
-    h4 = bucketed(h1, 4)
     m15, m15_src = derive_m15()
 
     S = {"m15": state(m15, "M15") if m15 else None,
          "h1": state(h1, "H1"),
-         "h4": state(h4, "H4")}
-    if d1_ok:
-        S["d1"] = state(d1r, "D1")
-    if not (S["h1"] and S["h4"]):
-        print("🚨 ABORT — state failed")
-        send_tg("🚨 GOLD ABORT\nState failed.")
-        return
+         "h4": state(h4, "H4"),
+         "d1": state(d1r, "D1")}
+    if not (S["h1"] and S["h4"] and S["d1"]):
+        msg = "🚨 GOLD ABORT\nState failed."
+        print(msg); send_tg(msg); return
 
-    m = S["m15"]
-    hh = S["h1"]
-    h4s = S["h4"]
-    dd = S.get("d1") or {"bias": 0.0, "rsi": 50.0, "label": "D1(proxy=H4)"}
-    if dd.get("label", "").startswith("D1(proxy"):
-        dd["bias"] = h4s["bias"]
-        dd["rsi"] = h4s["rsi"]
-
-    for tf in (m, hh, h4s):
-        if tf is not None:
-            tf["price"] = live_p
-    if S.get("d1"):
-        S["d1"]["price"] = live_p
+    m = S["m15"]; hh = S["h1"]; h4s = S["h4"]; dd = S["d1"]
+    for tf in (m, hh, h4s, dd):
+        if tf is not None: tf["price"] = live_p
     spot = live_p
 
     print(f"[main] H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
-    if d1_ok:
-        print(f"[main] D1 OK · close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f}")
-    else:
-        print(f"[main] D1 SKIPPED · H4 bias used as proxy")
+    print(f"[main] D1 close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f} "
+          f"(derived from H1, {len(d1r)} bars)")
     print(f"bias · M15={(m['bias'] if m else 0):+.2f} H1={hh['bias']:+.2f} "
-          f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}"
-          f"{' (proxy)' if not d1_ok else ''}")
+          f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
 
     st = load_state()
     print(f"[state] open={len(st['open_signals'])} · history={len(st['history'])}")
-
     resolved, still = check_open_signals(st, spot, now)
     st["open_signals"] = still
     for r in resolved:
@@ -752,30 +650,23 @@ def main():
     extreme = hh["rsi"] > 85 or hh["rsi"] < 15
 
     if extreme:
-        if not d1_ok:
-            print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME · D1 unreliable → skipping reversal")
-            cands = []
-        else:
-            print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME → reversal mode only")
-            cands = []
-            if m:
-                for side, why in find_reversal(m, hh, h4s, dd):
-                    b = build("scalp", m, side, why)
-                    if b:
-                        cands.append(("🔄 REVERSAL", "🔄", b))
-            if not cands:
-                print("[gate] no reversal confirmation")
+        print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME → reversal mode")
+        cands = []
+        if m:
+            for side, why in find_reversal(m, hh, h4s, dd):
+                b = build("scalp", m, side, why)
+                if b: cands.append(("🔄 REVERSAL", "🔄", b))
+        if not cands:
+            print("[gate] no reversal confirmation")
     else:
         cands = []
         if m:
             for side, why in find_scalp(m, hh, h4s):
                 b = build("scalp", m, side, why)
-                if b:
-                    cands.append(("⚡ SCALP", "⚡", b))
+                if b: cands.append(("⚡ SCALP", "⚡", b))
         for side, why in find_intraday(hh, h4s):
             b = build("intraday", hh, side, why)
-            if b:
-                cands.append(("🎯 INTRADAY", "🎯", b))
+            if b: cands.append(("🎯 INTRADAY", "🎯", b))
         print(f"candidates={len(cands)}")
 
     found = filter_cooldown(cands, st)
@@ -795,13 +686,10 @@ def main():
         if last_hb:
             try:
                 lt = datetime.datetime.fromisoformat(last_hb)
-                if lt.tzinfo is None:
-                    lt = lt.replace(tzinfo=UTC)
+                if lt.tzinfo is None: lt = lt.replace(tzinfo=UTC)
                 if (now - lt).total_seconds() < HEARTBEAT_HOURS * 3600:
                     should_send = False
-            except Exception:
-                pass
-
+            except Exception: pass
         if should_send:
             lines = [
                 "⏸ GOLD — No signal",
@@ -812,21 +700,19 @@ def main():
                 f"  H1 RSI: {hh['rsi']:.0f}",
                 f"  H1 bias: {hh['bias']:+.2f}",
                 f"  H4 bias: {h4s['bias']:+.2f}",
+                f"  D1 bias: {dd['bias']:+.2f}",
             ]
-            if d1_ok:
-                lines.append(f"  D1 bias: {dd['bias']:+.2f}")
-            else:
-                lines.append("  D1: ⚠️ data unreliable")
             if hh["rsi"] > 85:
                 lines.append("")
                 lines.append("⚠️ H1 extremely overbought")
-                lines.append("   Waiting for pullback")
-                if not d1_ok:
-                    lines.append("   Reversal blocked (D1 missing)")
+                lines.append("   No new BUY until pullback")
+                if h4s["bias"] <= -0.3 and dd["bias"] <= -0.3:
+                    lines.append("   Reversal SHORT forming")
+                    lines.append("   Waiting M15 trigger")
             elif hh["rsi"] < 15:
                 lines.append("")
                 lines.append("⚠️ H1 extremely oversold")
-                lines.append("   Waiting for bounce")
+                lines.append("   No new SELL until bounce")
             else:
                 lines.append("")
                 lines.append("No clean setup — monitoring")
@@ -843,13 +729,10 @@ def main():
         head = f"🥇 GOLD — {now_pkt}\nSpot: {spot:.2f}"
         body = "\n\n".join(f"{n}\n{fmt_signal(s)}" for n, e, s in found)
         parts.append(f"{head}\n\n{body}")
-    if resolved:
-        parts.append(fmt_prev(resolved))
-    if found:
-        parts.append(fmt_open(st))
+    if resolved: parts.append(fmt_prev(resolved))
+    if found: parts.append(fmt_open(st))
     s = fmt_stats(st)
-    if s:
-        parts.append(s)
+    if s: parts.append(s)
     send_tg("\n\n".join(p for p in parts if p))
     print("→ processed")
 
