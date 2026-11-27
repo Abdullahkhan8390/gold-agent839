@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-agent.py v11.2 — calculated SL/TP + chase filter
-Fix: late-entry detection. If price already moved >1x ATR in
-signal direction from H1 close, downgrade grade (chase = worse entry).
-Fix: tp1_r / tp2_r display.
+agent.py v11.3 — SL→BE fix + max-1-per-side + volume warnings
+Fixes:
+1. TP1 hit → actually move SL to entry (BE)
+2. Block new signal if any open position on same side (no pyramiding)
+3. Warn on volume <0.5x for momentum signals (not just breakouts)
+4. Fix EXPIRED pips to include banked TP1 profit
 """
 import os, json, datetime, requests
 
@@ -19,6 +21,7 @@ HEARTBEAT_HOURS = 4
 NEWS_BUFFER_MIN = 30
 DXY_CONFLICT_PCT = 0.4
 VOLUME_WEAK_RATIO = 0.8
+VOLUME_VERY_WEAK = 0.5
 
 CFG = {
     "scalp":    {"sl_mult": 1.2, "min_pips": 30, "max_pips": 80,
@@ -74,12 +77,10 @@ def fetch_twelvedata(interval="1h", outputsize=500):
     key = os.environ.get("TWELVEDATA_KEY")
     if not key: return []
     try:
-        r = requests.get(
-            "https://api.twelvedata.com/time_series",
+        r = requests.get("https://api.twelvedata.com/time_series",
             params={"symbol": "XAU/USD", "interval": interval,
                     "outputsize": outputsize, "apikey": key,
-                    "timezone": "UTC", "order": "ASC"},
-            timeout=30)
+                    "timezone": "UTC", "order": "ASC"}, timeout=30)
         j = r.json()
     except Exception:
         return []
@@ -106,13 +107,12 @@ def closed_only(rows, tf_hours):
     return rows
 
 
-# ==================== TIER 1 FILTERS ====================
+# ==================== FILTERS ====================
 
 def fetch_news_events():
     try:
-        r = requests.get(
-            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-            headers=UA, timeout=10)
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                         headers=UA, timeout=10)
         if r.status_code != 200: return []
         events = r.json()
     except Exception:
@@ -166,31 +166,25 @@ def fetch_gc_volume_ratio():
 
 
 def grade_signal(sig, ctx, h1_close=None, ref_atr=None):
-    score = 100
-    notes = []
+    score = 100; notes = []
     
-    # ===== CHASE CHECK =====
+    # Chase check
     if h1_close is not None and ref_atr and ref_atr > 0:
         if sig["side"] == "SHORT":
             moved = h1_close - sig["entry"]
         else:
             moved = sig["entry"] - h1_close
         moved_atr = moved / ref_atr
-        
         if moved_atr > 1.5:
-            score -= 50
-            notes.append(f"🚫 Late chase {moved_atr:+.1f}×ATR past H1")
+            score -= 50; notes.append(f"🚫 Late chase {moved_atr:+.1f}×ATR past H1")
         elif moved_atr > 1.0:
-            score -= 30
-            notes.append(f"⚠️ Late entry {moved_atr:+.1f}×ATR past H1")
+            score -= 30; notes.append(f"⚠️ Late entry {moved_atr:+.1f}×ATR past H1")
         elif moved_atr > 0.5:
-            score -= 15
-            notes.append(f"⚠️ Entry {moved_atr:+.1f}×ATR into move")
+            score -= 15; notes.append(f"⚠️ Entry {moved_atr:+.1f}×ATR into move")
         elif moved_atr < -0.3:
             notes.append(f"✅ Pullback entry ({moved_atr:+.1f}×ATR)")
-        # -0.3 to +0.5 → no note, clean
     
-    # ===== NEWS =====
+    # News
     if not ctx["news_ok"]:
         score -= 50
         ne = ctx["news_event"] or {}
@@ -198,7 +192,7 @@ def grade_signal(sig, ctx, h1_close=None, ref_atr=None):
         when = f"in {mins}min" if mins >= 0 else f"{abs(mins)}min ago"
         notes.append(f"🚫 News: {ne.get('title','?')} ({when})")
     
-    # ===== DXY =====
+    # DXY
     dxy = ctx.get("dxy_change_4h")
     if dxy is not None:
         if sig["side"] == "LONG" and dxy > DXY_CONFLICT_PCT:
@@ -208,14 +202,22 @@ def grade_signal(sig, ctx, h1_close=None, ref_atr=None):
         elif abs(dxy) >= DXY_CONFLICT_PCT:
             notes.append(f"✅ DXY {dxy:+.2f}% (aligned)")
     
-    # ===== VOLUME =====
-    if "breakout" in sig.get("why", "").lower():
-        vr = ctx.get("volume_ratio")
-        if vr is not None:
+    # Volume — v11.3: applies to momentum too
+    vr = ctx.get("volume_ratio")
+    if vr is not None:
+        why_lower = sig.get("why", "").lower()
+        if "breakout" in why_lower:
             if vr < VOLUME_WEAK_RATIO:
-                score -= 15; notes.append(f"⚠️ Weak volume {vr}x")
+                score -= 15; notes.append(f"⚠️ Weak volume {vr}x on breakout")
             else:
                 notes.append(f"✅ Volume {vr}x")
+        elif "momentum" in why_lower:
+            if vr < VOLUME_VERY_WEAK:
+                score -= 15
+                notes.append(f"⚠️ Very weak volume {vr}x on momentum")
+            elif vr < VOLUME_WEAK_RATIO:
+                score -= 8
+                notes.append(f"⚠️ Weak volume {vr}x on momentum")
     
     if score >= 80: grade = "A"
     elif score >= 60: grade = "B"
@@ -224,7 +226,7 @@ def grade_signal(sig, ctx, h1_close=None, ref_atr=None):
     return grade, score, notes
 
 
-# ==================== TF DERIVATION ====================
+# ==================== TF / INDICATORS ====================
 
 def derive_core_tfs():
     raw = fetch_twelvedata("1h", 5000)
@@ -293,8 +295,6 @@ def bucketed(rows, hours):
             b[k]["c"] = r["c"]
     return [b[k] for k in sorted(b)]
 
-
-# ==================== INDICATORS ====================
 
 def ema(vals, n):
     n = max(2, min(n, len(vals)))
@@ -499,6 +499,13 @@ def save_state(st):
 
 
 def check_open_signals(st, price, now):
+    """
+    v11.3 fixes:
+    - On TP1: actually move SL to entry (BE)
+    - On SL hit after TP1: exit at BE (entry), record +0.5R
+    - On TP2: proper 1.5R if TP1 was hit
+    - On EXPIRED: include banked TP1 profit
+    """
     resolved = []; still = []
     for sig in st["open_signals"]:
         try:
@@ -506,45 +513,78 @@ def check_open_signals(st, price, now):
             if cr.tzinfo is None: cr = cr.replace(tzinfo=UTC)
         except Exception: continue
         age = (now - cr).total_seconds() / 3600.0
+        side = sig["side"]
+        entry = sig["entry"]
+        sl = sig["sl"]
+        tp1 = sig["tp1"]
+        tp2 = sig["tp2"]
+        risk = sig["risk"]
+        tp1_done = sig.get("tp1_hit", False)
+        
+        # Expire check FIRST
         if age > sig.get("max_hours", MAX_HOURS_OPEN):
-            sig.update({"result": "EXPIRED", "exit_price": price, "pips": 0.0,
+            if tp1_done:
+                # Banked +0.5R at TP1, exit remaining at current price
+                if side == "LONG":
+                    remain_r = (price - entry) / risk
+                else:
+                    remain_r = (entry - price) / risk
+                total_r = 0.5 + 0.5 * remain_r
+                pips = round(total_r * risk / PIP, 1)
+            else:
+                pips = 0.0
+            sig.update({"result": "EXPIRED", "exit_price": price, "pips": pips,
                         "closed_at": now.isoformat(), "age_hours": round(age, 1)})
-            resolved.append(sig); continue
-        side = sig["side"]; sl = sig["sl"]; tp1 = sig["tp1"]; tp2 = sig["tp2"]
-        risk = sig["risk"]; hit = None
+            resolved.append(sig)
+            continue
+        
+        # Determine hit - SL takes priority
+        hit = None
         if side == "LONG":
             if price <= sl: hit = "SL"
             elif price >= tp2: hit = "TP2"
-            elif price >= tp1: hit = "TP1"
+            elif price >= tp1 and not tp1_done: hit = "TP1"
         else:
             if price >= sl: hit = "SL"
             elif price <= tp2: hit = "TP2"
-            elif price <= tp1: hit = "TP1"
+            elif price <= tp1 and not tp1_done: hit = "TP1"
+        
         if hit == "SL":
-            if sig.get("tp1_hit"):
-                sig.update({"result": "BREAKEVEN", "pips": round(0.5 * risk / PIP, 1)})
+            if tp1_done:
+                # After BE move, SL is at entry = breakeven exit + banked TP1
+                sig.update({"result": "BREAKEVEN",
+                            "pips": round(0.5 * risk / PIP, 1),
+                            "exit_price": entry})  # exit at BE, not original SL
             else:
-                sig.update({"result": "LOSS", "pips": round(-risk / PIP, 1)})
-            sig.update({"exit_price": sl, "closed_at": now.isoformat(),
-                        "age_hours": round(age, 1)})
+                sig.update({"result": "LOSS",
+                            "pips": round(-risk / PIP, 1),
+                            "exit_price": sl})
+            sig.update({"closed_at": now.isoformat(), "age_hours": round(age, 1)})
             resolved.append(sig)
         elif hit == "TP2":
-            sig.update({"result": "WIN", "pips": round(1.5 * risk / PIP, 1),
-                        "exit_price": tp2, "closed_at": now.isoformat(),
-                        "age_hours": round(age, 1)})
+            # Half at TP1 (+1R) + Half at TP2 (+2R) = 1.5R
+            sig.update({"result": "WIN",
+                        "pips": round(1.5 * risk / PIP, 1),
+                        "exit_price": tp2})
+            sig.update({"closed_at": now.isoformat(), "age_hours": round(age, 1)})
             resolved.append(sig)
         elif hit == "TP1":
-            if not sig.get("tp1_hit"):
-                sig["tp1_hit"] = True; sig["tp1_hit_at"] = now.isoformat()
-                print(f"[tracker] {sig.get('id','?')} TP1 @ {tp1:.2f}")
+            # v11.3: ACTUALLY move SL to entry (BE)
+            sig["tp1_hit"] = True
+            sig["tp1_hit_at"] = now.isoformat()
+            sig["sl"] = entry  # ← REAL BE MOVEMENT
+            sig["sl_moved_to_be"] = True
+            print(f"[tracker] {sig.get('id','?')} TP1 @ {tp1:.2f} → SL moved to BE {entry:.2f}")
             still.append(sig)
         else:
             still.append(sig)
+    
     for sig in resolved:
         st["history"].append(sig)
         r = sig["result"]
         if r in ("WIN", "LOSS", "EXPIRED", "BREAKEVEN"):
-            key = {"WIN":"wins","LOSS":"losses","EXPIRED":"expired","BREAKEVEN":"breakeven"}[r]
+            key = {"WIN":"wins","LOSS":"losses",
+                   "EXPIRED":"expired","BREAKEVEN":"breakeven"}[r]
             st["stats"][key] += 1
         st["stats"]["total"] += 1
         st["stats"]["total_pips"] = round(st["stats"]["total_pips"] + sig.get("pips", 0), 1)
@@ -553,11 +593,25 @@ def check_open_signals(st, price, now):
 
 
 def filter_cooldown(cands, st):
+    """
+    v11.3: Max 1 open signal per side.
+    If any open position exists (LONG or SHORT), block new signals on that side.
+    This prevents pyramiding into correlated risk.
+    """
     now = datetime.datetime.now(UTC)
     out = []; seen = set()
+    open_sides = set(s["side"] for s in st["open_signals"])
+    
     for name, emoji, sig in cands:
         k = (sig["side"], round(sig["entry"], 1))
         if k in seen: continue
+        
+        # v11.3: Block if same side already open
+        if sig["side"] in open_sides:
+            print(f"[filter] blocked {sig['side']} — existing open position")
+            continue
+        
+        # Also keep cooldown for recently-closed signals
         blocked = False
         for s in st["open_signals"]:
             if s["side"] != sig["side"]: continue
@@ -569,6 +623,7 @@ def filter_cooldown(cands, st):
             except Exception: pass
         if blocked: continue
         seen.add(k); out.append((name, emoji, sig))
+        
     before = len(out)
     out = [c for c in out if c[2]["risk"] / PIP <= MAX_SL_PIPS]
     if len(out) < before:
@@ -637,7 +692,9 @@ def fmt_open(st):
     lines = [f"🔓 OPEN ({len(st['open_signals'])})"]
     for s in st["open_signals"]:
         arr = "BUY" if s["side"] == "LONG" else "SELL"
-        lines.append(f"  · {arr} @ {s['entry']:.2f} SL {s['sl']:.2f} TP2 {s['tp2']:.2f}")
+        be_note = " · BE" if s.get("tp1_hit") else ""
+        lines.append(f"  · {arr} @ {s['entry']:.2f} SL {s['sl']:.2f} "
+                     f"TP1 {s['tp1']:.2f} TP2 {s['tp2']:.2f}{be_note}")
     return "\n".join(lines)
 
 
@@ -667,7 +724,7 @@ def send_tg(text):
 # ==================== MAIN ====================
 
 def main():
-    print("=== agent.py v11.2 · calculated SL/TP + chase filter ===")
+    print("=== agent.py v11.3 · BE fix + max-1-per-side + volume warnings ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
@@ -727,11 +784,17 @@ def main():
     print(f"[filters] Volume: {volume_ratio if volume_ratio is not None else 'N/A'}x")
 
     st = load_state()
-    print(f"[state] open={len(st['open_signals'])} history={len(st['history'])}")
+    open_by_side = {}
+    for s in st["open_signals"]:
+        open_by_side[s["side"]] = open_by_side.get(s["side"], 0) + 1
+    print(f"[state] open={len(st['open_signals'])} history={len(st['history'])} "
+          f"· {open_by_side if open_by_side else 'none'}")
+    
     resolved, still = check_open_signals(st, spot, now)
     st["open_signals"] = still
     for r in resolved:
-        print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
+        print(f"[tracker] {r['result']}: {r['side']} @ {r['entry']:.2f} → "
+              f"{r['exit_price']:.2f} ({r['pips']:+.0f}p)")
 
     extreme = hh["rsi"] > 85 or hh["rsi"] < 15
     cands = []
@@ -819,16 +882,8 @@ def main():
                      "🔍 Filters:",
                      f"  News: {'🚫' if not news_ok else '✅ clear'}",
                      f"  DXY: {dxy_change if dxy_change is not None else 'N/A'}%",
-                     f"  Volume: {volume_ratio if volume_ratio is not None else 'N/A'}x"]
-            if hh["rsi"] > 85:
-                lines += ["", "⚠️ H1 overbought · reversal-only"]
-                if not news_ok: lines.append(f"   🚫 {news_event['title']}")
-                elif not (h4s["bias"] <= -0.25 and dd["bias"] <= -0.25):
-                    lines.append("   Waiting H4/D1 bearish align")
-                else:
-                    lines.append("   Waiting M15 trigger")
-            elif hh["rsi"] >= 82: lines += ["", "⚠️ Near-extreme · watching"]
-            elif hh["rsi"] < 18:  lines += ["", "⚠️ Oversold · watching"]
+                     f"  Volume: {volume_ratio if volume_ratio is not None else 'N/A'}x",
+                     "", f"🔓 Open: {len(st['open_signals'])}"]
             send_tg("\n".join(lines))
             st["last_heartbeat"] = now.isoformat()
             save_state(st); print("→ heartbeat sent")
@@ -842,7 +897,7 @@ def main():
                   for n, e, s in to_fire]
         parts.append(f"{head}\n\n" + "\n\n".join(bodies))
     if resolved: parts.append(fmt_prev(resolved))
-    if to_fire: parts.append(fmt_open(st))
+    if to_fire or st["open_signals"]: parts.append(fmt_open(st))
     s = fmt_stats(st)
     if s: parts.append(s)
     send_tg("\n\n".join(p for p in parts if p))
