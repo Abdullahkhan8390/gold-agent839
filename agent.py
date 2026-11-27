@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent.py v5 — XAUUSD signals + tracking + spot-consistent + all fixes baked in
+agent.py v6 — closed-candle indicators, no fake RSI, no fake D1 bias
 """
 import os, json, datetime, requests
 
@@ -93,12 +93,20 @@ def fetch_twelvedata(interval="1h", outputsize=500):
                          "l": float(v["low"]), "c": float(v["close"])})
         except Exception:
             continue
-    if rows:
-        print(f"[td] {len(rows)} bars · last={rows[-1]['c']:.2f} @ {j['values'][-1]['datetime']}")
     return rows
 
 
-def fetch_fresh(interval, rng, max_age_h):
+def closed_only(rows, tf_hours):
+    """Drop the last bar if it's still forming (close not final)."""
+    if not rows:
+        return rows
+    now_ts = datetime.datetime.now(UTC).timestamp()
+    if now_ts - rows[-1]["t"] < tf_hours * 3600:
+        return rows[:-1]
+    return rows
+
+
+def fetch_fresh(interval, rng, max_age_h, tf_hours):
     attempts = [
         ("GC=F",     True,  "query1"),
         ("GC=F",     False, "query1"),
@@ -115,7 +123,7 @@ def fetch_fresh(interval, rng, max_age_h):
         tag = f"{sym} {interval} {server}{'/p' if periods else '/r'}"
         if -0.5 <= age <= max_age_h:
             print(f"[data] OK {tag} · {age:.1f}h · {len(rows)} bars")
-            return rows, tag
+            return closed_only(rows, tf_hours), tag
         if best is None or abs(age) < abs(best[1]):
             best = (tag, age)
     td_map = {"1h":"1h","60m":"1h","15m":"15min","5m":"5min","1m":"1min","1d":"1day"}
@@ -125,7 +133,8 @@ def fetch_fresh(interval, rng, max_age_h):
         if rows:
             age = (datetime.datetime.now(UTC).timestamp() - rows[-1]["t"]) / 3600.0
             if -0.5 <= age <= max_age_h:
-                print(f"[data] OK TwelveData {tid} · {age:.1f}h · {len(rows)} bars")
+                rows = closed_only(rows, tf_hours)
+                print(f"[data] OK TwelveData {tid} · {age:.1f}h · {len(rows)} closed bars")
                 return rows, f"TwelveData {tid}"
             print(f"[data] TwelveData {tid} STALE {age:.1f}h")
     if best:
@@ -136,11 +145,11 @@ def fetch_fresh(interval, rng, max_age_h):
 
 
 def derive_h1():
-    h1, src = fetch_fresh("1h", "60d", MAX_AGE_H1_H)
+    h1, src = fetch_fresh("1h", "60d", MAX_AGE_H1_H, 1.0)
     if h1 and len(h1) >= 100:
         return h1, src
-    for small, rng in (("15m","30d"), ("5m","10d"), ("1m","5d")):
-        rows, src2 = fetch_fresh(small, rng, 1.0)
+    for small, rng, th in (("15m","30d",0.25), ("5m","10d",0.083), ("1m","5d",0.017)):
+        rows, src2 = fetch_fresh(small, rng, 1.0, th)
         if rows:
             h1 = bucketed(rows, 1)
             if len(h1) >= 100:
@@ -150,11 +159,11 @@ def derive_h1():
 
 
 def derive_m15():
-    m15, src = fetch_fresh("15m", "30d", MAX_AGE_M15_H)
+    m15, src = fetch_fresh("15m", "30d", MAX_AGE_M15_H, 0.25)
     if m15 and len(m15) >= 60:
         return m15, src
-    for small, rng in (("5m","10d"), ("1m","5d")):
-        rows, src2 = fetch_fresh(small, rng, 1.0)
+    for small, rng, th in (("5m","10d",0.083), ("1m","5d",0.017)):
+        rows, src2 = fetch_fresh(small, rng, 1.0, th)
         if rows:
             m15 = bucketed(rows, 0.25)
             if len(m15) >= 60:
@@ -690,7 +699,7 @@ def send_tg(text):
 
 # ========== MAIN ==========
 def main():
-    print("=== agent.py v5 · all fixes baked in ===")
+    print("=== agent.py v6 · closed-candle indicators ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
@@ -713,7 +722,7 @@ def main():
         send_tg(msg)
         return
 
-    d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H)
+    d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H, 24.0)
     if not d1r or len(d1r) < 100:
         msg = "🚨 GOLD ABORT\nD1 staled."
         print(msg)
@@ -722,13 +731,12 @@ def main():
 
     if "TwelveData" in h1_src and "GC=F" in d1_src:
         td_d1 = fetch_twelvedata("1day", 500)
-        if td_d1 and len(td_d1) >= 100:
-            d1r = td_d1
-            d1_src = "TwelveData 1day"
-            print("[d1] switched to TwelveData for source consistency")
-
-    print(f"[main] H1={h1_src} · {len(h1)} bars · close={h1[-1]['c']:.2f}")
-    print(f"[main] D1={d1_src} · close={d1r[-1]['c']:.2f}")
+        if td_d1:
+            td_d1 = closed_only(td_d1, 24.0)
+            if len(td_d1) >= 100:
+                d1r = td_d1
+                d1_src = "TwelveData 1day"
+                print("[d1] switched to TwelveData for source consistency")
 
     h4 = bucketed(h1, 4)
     m15, m15_src = derive_m15()
@@ -741,7 +749,7 @@ def main():
     print(f"[live] {live_p:.2f} from {live_src}")
 
     gap = abs(live_p - h1[-1]["c"])
-    limit = max(live_p * 0.003, 3.0)
+    limit = max(live_p * 0.01, 15.0)
     if gap > limit:
         msg = (f"⚠️ GOLD ABORT — PRICE MISMATCH\n"
                f"Live: {live_p:.2f} ({live_src})\n"
@@ -750,7 +758,7 @@ def main():
         print(msg)
         send_tg(msg)
         return
-    print(f"[data] CLEAN · gap=${gap:.2f}")
+    print(f"[data] CLEAN · gap=${gap:.2f} (closed H1 vs live)")
 
     S = {"m15": state(m15, "M15") if m15 else None,
          "h1": state(h1, "H1"),
@@ -771,7 +779,12 @@ def main():
             tf["price"] = live_p
     spot = live_p
 
-    print(f"spot={spot:.2f} · H1={hh['bias']:+.2f} · H4={h4s['bias']:+.2f} · D1={dd['bias']:+.2f}")
+    print(f"[main] H1 close={hh['price'] if False else live_p:.2f} · "
+          f"H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
+    print(f"[main] D1 close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f} · "
+          f"EMA20={dd['e20']:.2f} EMA50={dd['e50']:.2f} EMA200={dd['e200']:.2f}")
+    print(f"bias · M15={m['bias']:+.2f} H1={hh['bias']:+.2f} "
+          f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
 
     st = load_state()
     print(f"[state] open={len(st['open_signals'])} · history={len(st['history'])}")
@@ -781,7 +794,7 @@ def main():
     for r in resolved:
         print(f"[tracker] {r['result']}: {r['side']} → {r['pips']:+.0f}p")
 
-    if hh["rsi"] > 90 or hh["rsi"] < 10:
+    if hh["rsi"] > 85 or hh["rsi"] < 15:
         print(f"[skip] H1 RSI {hh['rsi']:.0f} — extreme, no new signals")
         cands = []
     else:
