@@ -2,9 +2,8 @@
 """
 agent.py — XAUUSD (Gold) technical-only signal bot
 ═══════════════════════════════════════════════════════════════════
-REMOVED: LLM scoring · news sentiment · Fed sentiment · flip/strong/near gates
-KEPT:    Sweeps · EMA structure · RSI extremes · thrust · engulfing
-RULES:   SL ≤ 100 pips ($10) · TP1 = 1R · TP2 = 2R · more setups
+REMOVED: LLM · news · Fed · flip/strong/near gates
+RULES:   SL hard cap $10 · TP1 = 1R · TP2 = 2R · more setups
 """
 import os, json, datetime, requests
 
@@ -13,13 +12,13 @@ PKT = datetime.timezone(datetime.timedelta(hours=5))
 SYMBOL = "GC=F"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 PIP = 0.10
-COOLDOWN_HOURS = 2
+COOLDOWN_HOURS = 1
 STATE_FILE = "signal_state.json"
 
 CFG = {
-    "scalp":    {"sl": 0.55, "max_sl": 10.0, "hold": "30m–4h"},
-    "fast":     {"sl": 0.70, "max_sl": 10.0, "hold": "1–6h"},
-    "intraday": {"sl": 0.90, "max_sl": 12.0, "hold": "4–24h"},
+    "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m–4h"},
+    "fast":     {"sl": 0.50, "max_sl": 10.0, "hold": "1–6h"},
+    "intraday": {"sl": 0.65, "max_sl": 12.0, "hold": "4–24h"},
 }
 
 
@@ -83,18 +82,14 @@ def rsi_last(vals, n=14):
     g = l = 0.0
     for i in range(1, len(seg)):
         d = seg[i] - seg[i - 1]
-        if d > 0:
-            g += d
-        else:
-            l += -d
-    if l == 0:
-        return 100.0
+        if d > 0: g += d
+        else: l += -d
+    if l == 0: return 100.0
     return 100 - 100 / (1 + g / l)
 
 
 def atr_last(highs, lows, closes, n=14):
-    if len(closes) < n + 1:
-        return 0.0
+    if len(closes) < n + 1: return 0.0
     trs = []
     for i in range(len(closes) - n, len(closes)):
         trs.append(max(highs[i] - lows[i],
@@ -104,8 +99,7 @@ def atr_last(highs, lows, closes, n=14):
 
 
 def state(rows, label):
-    if len(rows) < 60:
-        return None
+    if len(rows) < 60: return None
     closes = [r["c"] for r in rows]
     highs = [r["h"] for r in rows]
     lows = [r["l"] for r in rows]
@@ -115,8 +109,7 @@ def state(rows, label):
     e200 = ema(closes, 200)[-1]
     rv = rsi_last(closes)
     a = atr_last(highs, lows, closes)
-    if a <= 0:
-        a = max(price * 0.0005, 0.01)
+    if a <= 0: a = max(price * 0.0005, 0.01)
     score = 0
     score += 1 if price > e200 else -1
     score += 1 if e20 > e50 else -1
@@ -131,76 +124,116 @@ def state(rows, label):
 
 
 def build(kind, tf, side, why):
+    """Build signal with SL hard-capped at max_sl. Never returns None unless SL degenerate."""
     cfg = CFG[kind]
     price, a = tf["price"], tf["atr"]
+    max_sl = cfg["max_sl"]
+
     if side == "LONG":
         sl_atr = price - cfg["sl"] * a
         sl_struct = tf["lo_prev"] - 0.10 * a
-        sl = max(sl_atr, sl_struct) if (price - sl_struct) <= 2.0 * a else sl_atr
+        # Tighter of the two (structure or ATR), but never tighter than 0.20 ATR
+        sl = max(sl_atr, sl_struct) if sl_struct < price else sl_atr
+        if price - sl < 0.20 * a:
+            sl = price - 0.20 * a
+        # Hard cap
+        if price - sl > max_sl:
+            sl = price - max_sl
         risk = price - sl
-        if risk <= 0 or risk > cfg["max_sl"]:
-            return None
+        if risk <= 0.05: return None
         tp1 = price + risk
         tp2 = price + risk * 2
     else:
         sl_atr = price + cfg["sl"] * a
         sl_struct = tf["hi_prev"] + 0.10 * a
-        sl = min(sl_atr, sl_struct) if (sl_struct - price) <= 2.0 * a else sl_atr
+        sl = min(sl_atr, sl_struct) if sl_struct > price else sl_atr
+        if sl - price < 0.20 * a:
+            sl = price + 0.20 * a
+        if sl - price > max_sl:
+            sl = price + max_sl
         risk = sl - price
-        if risk <= 0 or risk > cfg["max_sl"]:
-            return None
+        if risk <= 0.05: return None
         tp1 = price - risk
         tp2 = price - risk * 2
+
     return {"kind": kind, "side": side, "entry": price, "sl": sl,
             "tp1": tp1, "tp2": tp2, "risk": risk,
             "why": why, "hold": cfg["hold"], "tf": tf["label"]}
 
 
-def find_scalp(m, hh):
-    if not m or len(m["_bars"]) < 21:
-        return []
-    a15, price, rsi = m["atr"], m["price"], m["rsi"]
-    bars = m["_bars"]; last = bars[-1]; out = []
+# ═══════════════════════════════════════════════════════════════════
+# SETUP DETECTORS — 8 types per tier, fires more often
+# ═══════════════════════════════════════════════════════════════════
 
-    pull_up = 0 <= price - m["e20"] <= 0.7 * a15
-    pull_dn = 0 <= m["e20"] - price <= 0.7 * a15
-    brk_up = price >= m["hi_prev"]
-    brk_dn = price <= m["lo_prev"]
+def find_scalp(m, hh, h4s):
+    if not m or len(m["_bars"]) < 25: return []
+    a = m["atr"]; price = m["price"]; rsi = m["rsi"]
+    bars = m["_bars"]; last = bars[-1]; prev = bars[-2]
+    out = []
 
-    if hh["bias"] > 0 and rsi < 72 and pull_up:
-        out.append(("LONG", "H1 up + M15 pullback to EMA20"))
-    if hh["bias"] < 0 and rsi > 28 and pull_dn:
-        out.append(("SHORT", "H1 down + M15 rejecting EMA20"))
-    if hh["bias"] >= 0 and brk_up and rsi < 78:
-        out.append(("LONG", f"M15 breakout above {m['hi_prev']:.2f}"))
-    if hh["bias"] <= 0 and brk_dn and rsi > 22:
-        out.append(("SHORT", f"M15 breakdown below {m['lo_prev']:.2f}"))
+    last_bull = last["c"] > last["o"]
+    last_bear = last["c"] < last["o"]
+    prev_bull = prev["c"] > prev["o"]
+    prev_bear = prev["c"] < prev["o"]
+    body = abs(last["c"] - last["o"])
+    near_e20 = abs(price - m["e20"]) <= 1.0 * a
+    above_hi = price >= m["hi_prev"]
+    below_lo = price <= m["lo_prev"]
 
-    recent_low = min(b["l"] for b in bars[-21:-1])
-    recent_high = max(b["h"] for b in bars[-21:-1])
-    if last["l"] < recent_low and last["c"] > recent_low and hh["bias"] >= 0:
-        out.append(("LONG", f"M15 sweep {recent_low:.2f} + reclaim"))
-    if last["h"] > recent_high and last["c"] < recent_high and hh["bias"] <= 0:
-        out.append(("SHORT", f"M15 sweep {recent_high:.2f} + rejection"))
+    # ── LONG ──
+    if hh["bias"] >= 0:
+        if last_bull and body > 0.35 * a and rsi < 78:
+            out.append(("LONG", f"M15 momentum bar (H1 up, RSI {rsi:.0f})"))
+        if near_e20 and last_bull and rsi < 72:
+            out.append(("LONG", "M15 pullback to EMA20, holding"))
+        if above_hi:
+            out.append(("LONG", f"M15 breakout > {m['hi_prev']:.2f}"))
+        if last_bull and prev_bull:
+            out.append(("LONG", "M15 2-bar bullish follow"))
+        if rsi < 32:
+            out.append(("LONG", f"M15 oversold bounce (RSI {rsi:.0f})"))
+        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3 and last_bull:
+            out.append(("LONG", "H1+H4 bull confluence"))
 
-    if rsi < 25 and price > m["e200"] and hh["bias"] >= 0:
-        out.append(("LONG", f"M15 oversold bounce (RSI {rsi:.0f})"))
-    if rsi > 75 and price < m["e200"] and hh["bias"] <= 0:
-        out.append(("SHORT", f"M15 overbought fade (RSI {rsi:.0f})"))
+    # ── SHORT ──
+    if hh["bias"] <= 0:
+        if last_bear and body > 0.35 * a and rsi > 22:
+            out.append(("SHORT", f"M15 momentum bar (H1 down, RSI {rsi:.0f})"))
+        if near_e20 and last_bear and rsi > 28:
+            out.append(("SHORT", "M15 pullback to EMA20, rejecting"))
+        if below_lo:
+            out.append(("SHORT", f"M15 breakdown < {m['lo_prev']:.2f}"))
+        if last_bear and prev_bear:
+            out.append(("SHORT", "M15 2-bar bearish follow"))
+        if rsi > 68:
+            out.append(("SHORT", f"M15 overbought fade (RSI {rsi:.0f})"))
+        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3 and last_bear:
+            out.append(("SHORT", "H1+H4 bear confluence"))
+
+    # ── SWEEP (last 3 bars, not just last) ──
+    if len(bars) >= 24:
+        recent_lo = min(b["l"] for b in bars[-21:-3])
+        recent_hi = max(b["h"] for b in bars[-21:-3])
+        for b in bars[-3:]:
+            if b["l"] < recent_lo and b["c"] > recent_lo and hh["bias"] >= 0:
+                out.append(("LONG", f"M15 swept {recent_lo:.2f}, reclaimed")); break
+        for b in bars[-3:]:
+            if b["h"] > recent_hi and b["c"] < recent_hi and hh["bias"] <= 0:
+                out.append(("SHORT", f"M15 swept {recent_hi:.2f}, rejected")); break
+
     return out
 
 
-def find_fast(m):
-    if not m or len(m["_bars"]) < 3:
-        return []
-    a15 = m["atr"]; bars = m["_bars"]
+def find_fast(m, hh):
+    if not m or len(m["_bars"]) < 3: return []
+    a = m["atr"]; bars = m["_bars"]
     last, prev = bars[-1], bars[-2]
     body = abs(last["c"] - last["o"]); out = []
 
-    if last["c"] > last["o"] and body > 0.7 * a15:
-        out.append(("LONG", f"M15 thrust up (body {body/a15:.1f}×ATR)"))
-    if last["c"] < last["o"] and body > 0.7 * a15:
-        out.append(("SHORT", f"M15 thrust down (body {body/a15:.1f}×ATR)"))
+    if last["c"] > last["o"] and body > 0.55 * a and hh["bias"] >= 0:
+        out.append(("LONG", f"M15 thrust up ({body/a:.1f}×ATR)"))
+    if last["c"] < last["o"] and body > 0.55 * a and hh["bias"] <= 0:
+        out.append(("SHORT", f"M15 thrust down ({body/a:.1f}×ATR)"))
     if last["c"] > last["o"] and prev["c"] < prev["o"] \
        and last["c"] > prev["o"] and last["o"] < prev["c"]:
         out.append(("LONG", "M15 bullish engulfing"))
@@ -211,65 +244,95 @@ def find_fast(m):
 
 
 def find_intraday(hh, h4s):
-    if not hh or len(hh["_bars"]) < 21:
-        return []
-    a1, price, rsi = hh["atr"], hh["price"], hh["rsi"]
-    bars = hh["_bars"]; last = bars[-1]; out = []
+    if not hh or len(hh["_bars"]) < 21: return []
+    a = hh["atr"]; price = hh["price"]; rsi = hh["rsi"]
+    bars = hh["_bars"]; last = bars[-1]; prev = bars[-2]
+    out = []
 
-    pull_up = 0 <= price - hh["e20"] <= 0.8 * a1
-    pull_dn = 0 <= hh["e20"] - price <= 0.8 * a1
-    brk_up = price >= hh["hi_prev"]
-    brk_dn = price <= hh["lo_prev"]
+    last_bull = last["c"] > last["o"]
+    last_bear = last["c"] < last["o"]
+    prev_bull = prev["c"] > prev["o"]
+    prev_bear = prev["c"] < prev["o"]
+    body = abs(last["c"] - last["o"])
+    near_e20 = abs(price - hh["e20"]) <= 1.0 * a
+    above_hi = price >= hh["hi_prev"]
+    below_lo = price <= hh["lo_prev"]
 
-    if (h4s["bias"] > 0 or hh["bias"] > 0) and rsi < 74 and pull_up:
-        out.append(("LONG", "H1 pullback to EMA20 (bull structure)"))
-    if (h4s["bias"] < 0 or hh["bias"] < 0) and rsi > 26 and pull_dn:
-        out.append(("SHORT", "H1 rejecting EMA20 (bear structure)"))
-    if brk_up and rsi < 76:
-        out.append(("LONG", f"H1 breakout above {hh['hi_prev']:.2f}"))
-    if brk_dn and rsi > 24:
-        out.append(("SHORT", f"H1 breakdown below {hh['lo_prev']:.2f}"))
+    if hh["bias"] >= 0 or h4s["bias"] >= 0:
+        if last_bull and body > 0.35 * a and rsi < 76:
+            out.append(("LONG", f"H1 momentum bar (RSI {rsi:.0f})"))
+        if near_e20 and last_bull and rsi < 72:
+            out.append(("LONG", "H1 pullback to EMA20, holding"))
+        if above_hi:
+            out.append(("LONG", f"H1 breakout > {hh['hi_prev']:.2f}"))
+        if last_bull and prev_bull:
+            out.append(("LONG", "H1 2-bar bullish follow"))
+        if rsi < 32:
+            out.append(("LONG", f"H1 oversold bounce (RSI {rsi:.0f})"))
+        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3:
+            out.append(("LONG", "H1+H4 bull confluence"))
 
-    recent_low = min(b["l"] for b in bars[-21:-1])
-    recent_high = max(b["h"] for b in bars[-21:-1])
-    if last["l"] < recent_low and last["c"] > recent_low:
-        out.append(("LONG", f"H1 sweep {recent_low:.2f} + reclaim"))
-    if last["h"] > recent_high and last["c"] < recent_high:
-        out.append(("SHORT", f"H1 sweep {recent_high:.2f} + rejection"))
+    if hh["bias"] <= 0 or h4s["bias"] <= 0:
+        if last_bear and body > 0.35 * a and rsi > 24:
+            out.append(("SHORT", f"H1 momentum bar (RSI {rsi:.0f})"))
+        if near_e20 and last_bear and rsi > 28:
+            out.append(("SHORT", "H1 pullback to EMA20, rejecting"))
+        if below_lo:
+            out.append(("SHORT", f"H1 breakdown < {hh['lo_prev']:.2f}"))
+        if last_bear and prev_bear:
+            out.append(("SHORT", "H1 2-bar bearish follow"))
+        if rsi > 68:
+            out.append(("SHORT", f"H1 overbought fade (RSI {rsi:.0f})"))
+        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3:
+            out.append(("SHORT", "H1+H4 bear confluence"))
+
+    if len(bars) >= 24:
+        recent_lo = min(b["l"] for b in bars[-21:-3])
+        recent_hi = max(b["h"] for b in bars[-21:-3])
+        for b in bars[-3:]:
+            if b["l"] < recent_lo and b["c"] > recent_lo:
+                out.append(("LONG", f"H1 swept {recent_lo:.2f}, reclaimed")); break
+        for b in bars[-3:]:
+            if b["h"] > recent_hi and b["c"] < recent_hi:
+                out.append(("SHORT", f"H1 swept {recent_hi:.2f}, rejected")); break
+
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════
+# STATE / COOLDOWN / TELEGRAM
+# ═══════════════════════════════════════════════════════════════════
+
 def load_state():
     if os.path.exists(STATE_FILE):
-        try:
-            return json.load(open(STATE_FILE))
-        except Exception:
-            pass
+        try: return json.load(open(STATE_FILE))
+        except Exception: pass
     return {"recent": []}
 
 
 def save_state(st):
-    try:
-        json.dump(st, open(STATE_FILE, "w"), indent=2, default=str)
-    except Exception as e:
-        print("[state] save failed:", e)
+    try: json.dump(st, open(STATE_FILE, "w"), indent=2, default=str)
+    except Exception as e: print("[state] save failed:", e)
 
 
 def filter_cooldown(signals, st):
     now = datetime.datetime.now(UTC)
     out = []
+    seen_keys = set()
     for name, emoji, sig in signals:
-        same = [r for r in st["recent"] if r["side"] == sig["side"]]
-        if same:
+        key = (sig["side"], round(sig["entry"], 1))
+        if key in seen_keys:
+            continue
+        same_dir = [r for r in st["recent"] if r["side"] == sig["side"]]
+        if same_dir:
             try:
-                last = datetime.datetime.fromisoformat(same[-1]["time"])
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=UTC)
-                if (now - last).total_seconds() / 3600 < COOLDOWN_HOURS:
-                    print(f"  [skip] {sig['side']} in cooldown ({sig['kind']})")
+                last_t = datetime.datetime.fromisoformat(same_dir[-1]["time"])
+                if last_t.tzinfo is None: last_t = last_t.replace(tzinfo=UTC)
+                if (now - last_t).total_seconds() / 3600 < COOLDOWN_HOURS:
                     continue
             except Exception:
                 pass
+        seen_keys.add(key)
         out.append((name, emoji, sig))
     return out
 
@@ -277,7 +340,7 @@ def filter_cooldown(signals, st):
 def fmt_signal(sig):
     pips = sig["risk"] / PIP
     arrow = "🟢 BUY" if sig["side"] == "LONG" else "🔴 SELL"
-    grade = "🔥 HIGH" if pips <= 40 else ("✅ GOOD" if pips <= 70 else "🟡 OK")
+    grade = "🔥 HIGH" if pips <= 50 else ("✅ GOOD" if pips <= 80 else "🟡 OK")
     return (
         f"{arrow} @ {sig['entry']:.2f}   [{grade}]\n"
         f"  SL:  {sig['sl']:.2f}   ({pips:.0f} pips / ${sig['risk']:.2f})\n"
@@ -292,8 +355,7 @@ def send_tg(text):
     token = os.environ.get("TG_TOKEN")
     chat = os.environ.get("TG_CHAT")
     if not token or not chat:
-        print("[tg] no TG_TOKEN/TG_CHAT — skipping")
-        return
+        print("[tg] no TG_TOKEN/TG_CHAT — skipping"); return
     try:
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat, "text": text}, timeout=15)
@@ -322,16 +384,18 @@ def main():
     m, hh, h4s, dd = S["m15"], S["h1"], S["h4"], S["d1"]
     spot = hh["price"]
     now_pkt = datetime.datetime.now(PKT).strftime("%Y-%m-%d %H:%M PKT")
+    last_bar_pkt = datetime.datetime.fromtimestamp(hh["_bars"][-1]["t"], PKT).strftime("%Y-%m-%d %H:%M")
 
     print(f"spot={spot:.2f} · H1 bias={hh['bias']:+.2f} · H4 bias={h4s['bias']:+.2f} · D1 bias={dd['bias']:+.2f}")
+    print(f"last H1 bar: {last_bar_pkt} PKT")
 
-    # ── Collect all valid setups ──
+    # ─── Collect candidates ───
     candidates = []
     if m:
-        for side, why in find_scalp(m, hh):
+        for side, why in find_scalp(m, hh, h4s):
             b = build("scalp", m, side, why)
             if b: candidates.append(("⚡ SCALP", "⚡", b))
-        for side, why in find_fast(m):
+        for side, why in find_fast(m, hh):
             b = build("fast", m, side, why)
             if b: candidates.append(("💨 FAST", "💨", b))
     for side, why in find_intraday(hh, h4s):
@@ -345,14 +409,24 @@ def main():
     print(f"after cooldown={len(found)}")
 
     if not found:
-        print("no signal — quiet")
+        # Debug WHY
+        print("\n--- DEBUG: no setup fired ---")
+        if m:
+            lb = m["_bars"][-1]
+            bd = abs(lb["c"] - lb["o"]) / m["atr"]
+            dirn = "bull" if lb["c"] > lb["o"] else "bear"
+            print(f"M15: rsi={m['rsi']:.0f} last={dirn} body={bd:.2f}×ATR "
+                  f"px-e20={m['price']-m['e20']:+.2f} ATR={m['atr']:.2f}")
+        print(f"H1 bias={hh['bias']:+.2f} rsi={hh['rsi']:.0f}")
+        print(f"H4 bias={h4s['bias']:+.2f}")
+        print("If this repeats all day → cron too slow, or market genuinely ranging.")
         return
 
-    # ── Print ──
+    # ─── Print ───
     for name, emoji, sig in found:
         print(f"\n{emoji} {name} — {fmt_signal(sig)}")
 
-    # ── Save state ──
+    # ─── Save state ───
     now_iso = datetime.datetime.now(UTC).isoformat()
     for name, emoji, sig in found:
         st["recent"].append({
@@ -360,10 +434,10 @@ def main():
             "entry": sig["entry"], "sl": sig["sl"],
             "tp1": sig["tp1"], "tp2": sig["tp2"],
         })
-    st["recent"] = st["recent"][-50:]
+    st["recent"] = st["recent"][-100:]
     save_state(st)
 
-    # ── Telegram: only send when signals exist ──
+    # ─── Telegram ───
     if len(found) == 1:
         name, emoji, sig = found[0]
         text = f"🥇 GOLD {emoji} {name}\n{now_pkt}\n\n{fmt_signal(sig)}\n\nSpot: {spot:.2f}"
