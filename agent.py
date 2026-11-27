@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent.py v7 — closed candles + reversal mode + heartbeat + D1 fix
+agent.py v8 — D1 sanity check + no fake reversals
 """
 import os, json, datetime, requests
 
@@ -16,6 +16,7 @@ MAX_AGE_M15_H = 1.0
 MAX_AGE_H1_H  = 3.0
 MAX_AGE_D1_H  = 72.0
 HEARTBEAT_HOURS = 4
+D1_MAX_DEV_PCT = 3.0   # reject D1 if close deviates >3% from live spot
 
 CFG = {
     "scalp":    {"sl": 0.35, "max_sl": 10.0, "hold": "30m-4h"},
@@ -66,7 +67,6 @@ def fetch(interval, rng, symbol="GC=F", use_periods=False, server="query1"):
 def fetch_twelvedata(interval="1h", outputsize=500):
     key = os.environ.get("TWELVEDATA_KEY")
     if not key:
-        print("[td] no key")
         return []
     try:
         r = requests.get(
@@ -76,11 +76,9 @@ def fetch_twelvedata(interval="1h", outputsize=500):
                     "timezone": "UTC", "order": "ASC"},
             timeout=20)
         j = r.json()
-    except Exception as e:
-        print(f"[td] request: {e}")
+    except Exception:
         return []
     if j.get("status") == "error" or "values" not in j:
-        print(f"[td] error: {j.get('message','no values')}")
         return []
     rows = []
     for v in j["values"]:
@@ -136,10 +134,6 @@ def fetch_fresh(interval, rng, max_age_h, tf_hours):
                 print(f"[data] OK TwelveData {tid} · {age:.1f}h · {len(rows)} closed bars")
                 return rows, f"TwelveData {tid}"
             print(f"[data] TwelveData {tid} STALE {age:.1f}h")
-    if best:
-        print(f"[data] FAIL {interval}: best {best[0]} @ {best[1]:.1f}h")
-    else:
-        print(f"[data] FAIL {interval}: no data")
     return [], None
 
 
@@ -354,8 +348,6 @@ def find_scalp(m, hh, h4s):
             out.append(("LONG", "M15 2-bar bull"))
         if rsi < 32:
             out.append(("LONG", f"M15 oversold (RSI {rsi:.0f})"))
-        if hh["bias"] >= 0.3 and h4s["bias"] >= 0.3 and lb:
-            out.append(("LONG", "H1+H4 bull confluence"))
     if hh["bias"] <= 0:
         if lbe and body > 0.35 * a and rsi > 22:
             out.append(("SHORT", f"M15 momentum (RSI {rsi:.0f})"))
@@ -367,24 +359,6 @@ def find_scalp(m, hh, h4s):
             out.append(("SHORT", "M15 2-bar bear"))
         if rsi > 68:
             out.append(("SHORT", f"M15 overbought (RSI {rsi:.0f})"))
-        if hh["bias"] <= -0.3 and h4s["bias"] <= -0.3 and lbe:
-            out.append(("SHORT", "H1+H4 bear confluence"))
-    return out
-
-
-def find_fast(m, hh):
-    if not m or len(m["_bars"]) < 3:
-        return []
-    a = m["atr"]
-    bars = m["_bars"]
-    last = bars[-1]
-    prev = bars[-2]
-    body = abs(last["c"] - last["o"])
-    out = []
-    if last["c"] > last["o"] and body > 0.55 * a and hh["bias"] >= 0:
-        out.append(("LONG", f"M15 thrust ({body/a:.1f}xATR)"))
-    if last["c"] < last["o"] and body > 0.55 * a and hh["bias"] <= 0:
-        out.append(("SHORT", f"M15 thrust ({body/a:.1f}xATR)"))
     return out
 
 
@@ -429,7 +403,7 @@ def find_intraday(hh, h4s):
 
 
 def find_reversal(m, hh, h4s, dd):
-    """Extreme H1 RSI + H4/D1 confluence + M15 trigger candle."""
+    """Extreme H1 RSI + H4 + D1 confluence + M15 trigger candle."""
     if not m or len(m["_bars"]) < 5:
         return []
     bars = m["_bars"]
@@ -591,13 +565,11 @@ def filter_cooldown(cands, st):
             pips = c[2]["risk"] / PIP
             s = 200 - pips
             w = c[2]["why"].lower()
-            if "confluence" in w:
-                s += 30
             if "exhausted" in w:
-                s += 20
+                s += 30
             return s
         best = max(out, key=score)
-        print(f"[filter] contradictory ({len(out)}) → keeping {best[2]['side']}")
+        print(f"[filter] contradictory → keeping {best[2]['side']}")
         return [best]
 
     return out[:1]
@@ -669,7 +641,6 @@ def send_tg(text):
     except Exception:
         pass
     if not tk:
-        print("[tg] no env vars")
         return
     try:
         r = requests.post(
@@ -682,7 +653,7 @@ def send_tg(text):
 
 
 def main():
-    print("=== agent.py v7 · reversal + heartbeat + D1 fixed ===")
+    print("=== agent.py v8 · D1 sanity check activated ===")
     now = datetime.datetime.now(UTC)
     now_pkt = now.astimezone(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
@@ -695,20 +666,9 @@ def main():
 
     h1, h1_src = derive_h1()
     if not h1 or len(h1) < 100:
-        msg = "🚨 GOLD ABORT\nH1 staled."
-        print(msg)
-        send_tg(msg)
+        print("🚨 ABORT — H1 staled")
+        send_tg("🚨 GOLD ABORT\nH1 staled.")
         return
-
-    d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H, 24.0)
-    if not d1r or len(d1r) < 100:
-        msg = "🚨 GOLD ABORT\nD1 staled."
-        print(msg)
-        send_tg(msg)
-        return
-
-    h4 = bucketed(h1, 4)
-    m15, m15_src = derive_m15()
 
     live_p, live_age, live_src = get_live_quote(prefer_td=True)
     if live_p is None:
@@ -728,29 +688,58 @@ def main():
         return
     print(f"[data] CLEAN · gap=${gap:.2f}")
 
+    # D1 fetch + sanity check
+    d1r, d1_src = fetch_fresh("1d", "1y", MAX_AGE_D1_H, 24.0)
+    d1_ok = False
+    if d1r and len(d1r) >= 100:
+        d1_close = d1r[-1]["c"]
+        d1_dev = abs(d1_close - live_p) / live_p * 100
+        print(f"[d1] {d1_src} close={d1_close:.2f} dev={d1_dev:.1f}%")
+        if d1_dev <= D1_MAX_DEV_PCT:
+            d1_ok = True
+            print(f"[d1] OK — within {D1_MAX_DEV_PCT}% of spot")
+        else:
+            print(f"[d1] ⚠️ REJECTED — {d1_dev:.1f}% dev > {D1_MAX_DEV_PCT}%")
+            print(f"[d1] data corrupted upstream, using H4 as top bias proxy")
+    else:
+        print(f"[d1] fetch failed")
+
+    h4 = bucketed(h1, 4)
+    m15, m15_src = derive_m15()
+
     S = {"m15": state(m15, "M15") if m15 else None,
          "h1": state(h1, "H1"),
-         "h4": state(h4, "H4"),
-         "d1": state(d1r, "D1")}
-    if not (S["h1"] and S["h4"] and S["d1"]):
-        msg = "🚨 GOLD ABORT\nState failed."
-        print(msg)
-        send_tg(msg)
+         "h4": state(h4, "H4")}
+    if d1_ok:
+        S["d1"] = state(d1r, "D1")
+    if not (S["h1"] and S["h4"]):
+        print("🚨 ABORT — state failed")
+        send_tg("🚨 GOLD ABORT\nState failed.")
         return
 
     m = S["m15"]
     hh = S["h1"]
     h4s = S["h4"]
-    dd = S["d1"]
-    for tf in (m, hh, h4s, dd):
+    dd = S.get("d1") or {"bias": 0.0, "rsi": 50.0, "label": "D1(proxy=H4)"}
+    if dd.get("label", "").startswith("D1(proxy"):
+        dd["bias"] = h4s["bias"]
+        dd["rsi"] = h4s["rsi"]
+
+    for tf in (m, hh, h4s):
         if tf is not None:
             tf["price"] = live_p
+    if S.get("d1"):
+        S["d1"]["price"] = live_p
     spot = live_p
 
     print(f"[main] H1 RSI={hh['rsi']:.0f} · ATR={hh['atr']:.2f}")
-    print(f"[main] D1(GC=F) close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f}")
+    if d1_ok:
+        print(f"[main] D1 OK · close={d1r[-1]['c']:.2f} · RSI={dd['rsi']:.0f}")
+    else:
+        print(f"[main] D1 SKIPPED · H4 bias used as proxy")
     print(f"bias · M15={(m['bias'] if m else 0):+.2f} H1={hh['bias']:+.2f} "
-          f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}")
+          f"H4={h4s['bias']:+.2f} D1={dd['bias']:+.2f}"
+          f"{' (proxy)' if not d1_ok else ''}")
 
     st = load_state()
     print(f"[state] open={len(st['open_signals'])} · history={len(st['history'])}")
@@ -763,15 +752,19 @@ def main():
     extreme = hh["rsi"] > 85 or hh["rsi"] < 15
 
     if extreme:
-        print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME → reversal mode only")
-        cands = []
-        if m:
-            for side, why in find_reversal(m, hh, h4s, dd):
-                b = build("scalp", m, side, why)
-                if b:
-                    cands.append(("🔄 REVERSAL", "🔄", b))
-        if not cands:
-            print("[gate] no reversal confirmation — staying out")
+        if not d1_ok:
+            print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME · D1 unreliable → skipping reversal")
+            cands = []
+        else:
+            print(f"[gate] H1 RSI {hh['rsi']:.0f} EXTREME → reversal mode only")
+            cands = []
+            if m:
+                for side, why in find_reversal(m, hh, h4s, dd):
+                    b = build("scalp", m, side, why)
+                    if b:
+                        cands.append(("🔄 REVERSAL", "🔄", b))
+            if not cands:
+                print("[gate] no reversal confirmation")
     else:
         cands = []
         if m:
@@ -779,10 +772,6 @@ def main():
                 b = build("scalp", m, side, why)
                 if b:
                     cands.append(("⚡ SCALP", "⚡", b))
-            for side, why in find_fast(m, hh):
-                b = build("fast", m, side, why)
-                if b:
-                    cands.append(("💨 FAST", "💨", b))
         for side, why in find_intraday(hh, h4s):
             b = build("intraday", hh, side, why)
             if b:
@@ -823,19 +812,21 @@ def main():
                 f"  H1 RSI: {hh['rsi']:.0f}",
                 f"  H1 bias: {hh['bias']:+.2f}",
                 f"  H4 bias: {h4s['bias']:+.2f}",
-                f"  D1 bias: {dd['bias']:+.2f}",
             ]
+            if d1_ok:
+                lines.append(f"  D1 bias: {dd['bias']:+.2f}")
+            else:
+                lines.append("  D1: ⚠️ data unreliable")
             if hh["rsi"] > 85:
                 lines.append("")
                 lines.append("⚠️ H1 extremely overbought")
-                lines.append("   No new BUY until pullback")
-                if h4s["bias"] <= -0.3 and dd["bias"] <= -0.3:
-                    lines.append("   Reversal SHORT setup forming")
-                    lines.append("   Waiting for M15 trigger candle")
+                lines.append("   Waiting for pullback")
+                if not d1_ok:
+                    lines.append("   Reversal blocked (D1 missing)")
             elif hh["rsi"] < 15:
                 lines.append("")
                 lines.append("⚠️ H1 extremely oversold")
-                lines.append("   No new SELL until bounce")
+                lines.append("   Waiting for bounce")
             else:
                 lines.append("")
                 lines.append("No clean setup — monitoring")
@@ -844,7 +835,7 @@ def main():
             save_state(st)
             print("→ heartbeat sent")
         else:
-            print("quiet — no signal, heartbeat rate-limited")
+            print("quiet — heartbeat rate-limited")
         return
 
     parts = []
