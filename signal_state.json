@@ -3,6 +3,30 @@
     {
       "kind": "scalp",
       "side": "LONG",
+      "entry": 3654.43649,
+      "sl": 3651.43649,
+      "tp1": 3657.43649,
+      "tp2": 3660.43649,
+      "risk": 3.0,
+      "why": "M15 2-bar bull",
+      "hold": "30m-4h",
+      "tf": "M15",
+      "sl_pips": 30.0,
+      "atr_used": 0.42114071428565175,
+      "tp1_r": 1.0,
+      "tp2_r": 2.0,
+      "grade": "A",
+      "score": 100,
+      "filter_notes": [],
+      "id": "L20261127233813",
+      "created_at": "2026-11-27T23:38:13.042202+00:00",
+      "max_hours": 24
+    }
+  ],
+  "history": [
+    {
+      "kind": "scalp",
+      "side": "LONG",
       "entry": 3628.18373,
       "sl": 3628.18373,
       "tp1": 3636.18373,
@@ -25,7 +49,12 @@
       "max_hours": 24,
       "tp1_hit": true,
       "tp1_hit_at": "2026-11-27T16:58:18.352432+00:00",
-      "sl_moved_to_be": true
+      "sl_moved_to_be": true,
+      "result": "WIN",
+      "pips": 120.0,
+      "exit_price": 3644.18373,
+      "closed_at": "2026-11-27T23:38:13.042202+00:00",
+      "age_hours": 8.2
     },
     {
       "kind": "scalp",
@@ -47,17 +76,21 @@
       "filter_notes": [],
       "id": "L20261127165818",
       "created_at": "2026-11-27T16:58:18.352432+00:00",
-      "max_hours": 24
+      "max_hours": 24,
+      "result": "WIN",
+      "pips": 120.0,
+      "exit_price": 3652.89264,
+      "closed_at": "2026-11-27T23:38:13.042202+00:00",
+      "age_hours": 6.7
     }
   ],
-  "history": [],
   "stats": {
-    "total": 0,
-    "wins": 0,
+    "total": 2,
+    "wins": 2,
     "losses": 0,
     "expired": 0,
     "breakeven": 0,
-    "total_pips": 0
+    "total_pips": 240.0
   },
   "last_heartbeat": "2026-11-27T17:10:06.280500+00:00",
   "last_c_warning": null
